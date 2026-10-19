@@ -129,10 +129,13 @@ impl Walker<'_> {
             number(span, "postgresql.instrumentation.startup_time_seconds").map(|s| s * 1e3), 0.0006 * loops_or_one);
         self.close("plan_rows", &node_type, &path, plan["Plan Rows"].as_f64(),
             number(span, "postgresql.plan.rows"), 0.5);
-        self.close("startup_cost", &node_type, &path, plan["Startup Cost"].as_f64(),
-            number(span, "postgresql.plan.startup_cost"), 0.006);
-        self.close("total_cost", &node_type, &path, plan["Total Cost"].as_f64(),
-            number(span, "postgresql.plan.total_cost"), 0.006);
+        // Costs are printed with 2 decimals; huge ones also lose f64 precision.
+        let cost_tolerance = |cost: Option<f64>| 0.006_f64.max(cost.unwrap_or(0.0).abs() * 1e-12);
+        let (startup_cost, total_cost) = (plan["Startup Cost"].as_f64(), plan["Total Cost"].as_f64());
+        self.close("startup_cost", &node_type, &path, startup_cost,
+            number(span, "postgresql.plan.startup_cost"), cost_tolerance(startup_cost));
+        self.close("total_cost", &node_type, &path, total_cost,
+            number(span, "postgresql.plan.total_cost"), cost_tolerance(total_cost));
         self.close("plan_width", &node_type, &path, plan["Plan Width"].as_f64(),
             number(span, "postgresql.plan.width_bytes"), 0.0);
 

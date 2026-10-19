@@ -293,6 +293,16 @@ mod tests {
         if findings.len() > MAX_REPORTED {
             report += &format!("FUZZ ... and {} more classes\n", findings.len() - MAX_REPORTED);
         }
+        // Rolled-back DML leaves dead tuples that cannot be vacuumed inside this one
+        // transaction, so the tables slowly bloat; report it to judge the drift.
+        let sizes = Spi::get_one::<String>(
+            "SELECT string_agg(relname || '=' || pg_size_pretty(pg_table_size(oid)), ' ' ORDER BY relname) \
+             FROM pg_class WHERE relname IN ('a', 'b', 'c', 'p1', 'p2', 'p3')",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        report += &format!("FUZZ table_sizes {sizes}\n");
         log_report(&report);
         assert!(findings.is_empty(), "{} mismatch classes, see the FUZZ lines above", findings.len());
     }
