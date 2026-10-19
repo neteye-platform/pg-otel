@@ -1,0 +1,51 @@
+name: Rust Tests
+
+on:
+  pull_request:
+    branches:
+      - "**"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit-tests:
+    name: unit-tests (PostgreSQL ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [18, 19]
+    env:
+      PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install PostgreSQL ${{ matrix.pg }} server headers
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y -v ${{ matrix.pg }}
+          sudo apt-get install -y --no-install-recommends postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} libclang-dev
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: pg${{ matrix.pg }}
+      - name: Install cargo-pgrx
+        run: cargo install --locked cargo-pgrx --version =0.19.1
+      - name: Initialise pgrx against the system PostgreSQL
+        run: cargo pgrx init --pg${{ matrix.pg }} "$PG_CONFIG"
+      - name: Let pgrx install the extension into the system PostgreSQL
+        run: sudo chown -R "$USER" "$("$PG_CONFIG" --sharedir)/extension" "$("$PG_CONFIG" --pkglibdir)"
+      - name: Run unit and pg_test tests
+        env:
+          PGRX_PG_CONFIG_PATH: ${{ env.PG_CONFIG }}
+        run: cargo test --workspace --locked --all-targets --no-default-features --features pg${{ matrix.pg }}
