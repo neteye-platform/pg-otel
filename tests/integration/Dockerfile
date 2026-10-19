@@ -5,6 +5,10 @@ ARG PG_MAJOR=18
 
 FROM postgres:${PG_MAJOR} AS build
 ARG PG_MAJOR
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# Versions are not pinned: the base image tracks the distribution's latest
+# PostgreSQL headers, which must match the server in the final stage.
+# hadolint ignore=DL3008
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential ca-certificates curl clang libclang-dev pkg-config \
@@ -24,3 +28,5 @@ RUN --mount=type=cache,target=/cargo/registry \
 
 FROM postgres:${PG_MAJOR}
 COPY --from=build /package/ /
+# The official image's postgres user (uid/gid 999).
+USER 999:999
