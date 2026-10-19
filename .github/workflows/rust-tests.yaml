@@ -26,11 +26,15 @@ jobs:
       - name: Install PostgreSQL 18 server headers
         run: |
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y --no-install-recommends postgresql-server-dev-18 libclang-dev
+          sudo apt-get install -y --no-install-recommends postgresql-18 postgresql-server-dev-18 libclang-dev
       - name: Install stable Rust toolchain
         run: rustup toolchain install stable --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Run unit tests
+      - name: Install cargo-pgrx
+        run: cargo install --locked cargo-pgrx --version =0.19.1
+      - name: Initialise pgrx against the system PostgreSQL
+        run: cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
+      - name: Run unit and pg_test tests
         env:
           PGRX_PG_CONFIG_PATH: /usr/lib/postgresql/18/bin/pg_config
         run: cargo test --workspace --locked --all-targets --no-default-features --features pg18
