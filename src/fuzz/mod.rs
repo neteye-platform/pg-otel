@@ -263,12 +263,34 @@ enum Outcome {
     PluginOnly(String),
 }
 
+/// Wall-clock split of the run, reported at the end to see where time goes.
+#[derive(Default)]
+struct Timings {
+    /// Whole `explain` calls, including the subtransaction.
+    explain_on: Duration,
+    explain_off: Duration,
+    /// The part of `explain` inside the subtransaction (SET LOCALs + EXPLAIN).
+    inner: Duration,
+    /// Planning + execution time as reported by EXPLAIN itself (successful runs).
+    server: Duration,
+    generate: Duration,
+    compare: Duration,
+    /// Cases that errored or timed out with the plugin on (then rerun off).
+    failed_cases: Duration,
+    /// Slowest cases: (wall time, index, query).
+    slowest: Vec<(Duration, u64, String)>,
+}
+
 fn explain(
     case: &Case,
     tracing: bool,
     timeout_ms: u64,
+    timings: &mut Timings,
 ) -> Result<(serde_json::Value, Vec<SpanData>), String> {
-    rolled_back(|| {
+    let started = Instant::now();
+    let mut inner = Duration::ZERO;
+    let result = rolled_back(|| {
+        let inner_started = Instant::now();
         for (name, value) in &case.settings {
             Spi::run(&format!("SET LOCAL {name} = '{value}'")).unwrap();
         }
@@ -294,20 +316,43 @@ fn explain(
             .expect("EXPLAIN failed")
             .expect("EXPLAIN returned no row")
             .0;
+        inner = inner_started.elapsed();
         (document, spans.into_iter().map(SpanData::from).collect())
-    })
+    });
+    let elapsed = started.elapsed();
+    if tracing {
+        timings.explain_on += elapsed;
+    } else {
+        timings.explain_off += elapsed;
+    }
+    timings.inner += inner;
+    if let Ok((document, _)) = &result {
+        let ms = |key: &str| document[0][key].as_f64().unwrap_or(0.0);
+        timings.server +=
+            Duration::from_secs_f64((ms("Planning Time") + ms("Execution Time")) / 1e3);
+    }
+    result
 }
 
-fn run_case(case: &Case, timeout_ms: u64) -> Outcome {
-    match explain(case, true, timeout_ms) {
-        Ok((document, spans)) => Outcome::Compared(compare(&document, &spans), false),
-        Err(on_error) => match explain(case, false, timeout_ms) {
+fn run_case(case: &Case, timeout_ms: u64, timings: &mut Timings) -> Outcome {
+    fn timed_compare(
+        timings: &mut Timings,
+        (document, spans): &(serde_json::Value, Vec<SpanData>),
+    ) -> compare::Comparison {
+        let started = Instant::now();
+        let comparison = compare(document, spans);
+        timings.compare += started.elapsed();
+        comparison
+    }
+    match explain(case, true, timeout_ms, timings) {
+        Ok(first) => Outcome::Compared(timed_compare(timings, &first), false),
+        Err(on_error) => match explain(case, false, timeout_ms, timings) {
             Err(off_error) if is_canceled(&on_error) && is_canceled(&off_error) => {
                 Outcome::GeneratorTimeout
             }
             Err(off_error) => Outcome::GeneratorError(off_error),
-            Ok(_) if is_canceled(&on_error) => match explain(case, true, timeout_ms) {
-                Ok((document, spans)) => Outcome::Compared(compare(&document, &spans), true),
+            Ok(_) if is_canceled(&on_error) => match explain(case, true, timeout_ms, timings) {
+                Ok(retry) => Outcome::Compared(timed_compare(timings, &retry), true),
                 Err(retry_error) => {
                     Outcome::PluginOnly(format!("{on_error}; retry: {retry_error}"))
                 }
@@ -363,6 +408,7 @@ mod tests {
             (0u64, 0u64, 0u64, 0u64);
         let mut allowed: BTreeMap<String, u64> = BTreeMap::new();
         let mut coverage: BTreeMap<String, u64> = BTreeMap::new();
+        let mut timings = Timings::default();
         let mut error_samples: HashMap<String, (u64, String)> = HashMap::new();
 
         let mut flaky: Vec<String> = Vec::new();
@@ -373,7 +419,9 @@ mod tests {
                 break;
             }
             let seed = case_seed(master, index);
+            let generated = Instant::now();
             let case = Case::generate(seed);
+            timings.generate += generated.elapsed();
             // Before running: if the backend dies, this is the last line.
             log_line(&format!(
                 "case master_seed={master} index={index} case_seed={seed} settings=[{}] query={}",
@@ -383,7 +431,16 @@ mod tests {
             total += 1;
 
             let mut found: Vec<(String, Vec<String>)> = Vec::new();
-            match run_case(&case, timeout_ms) {
+            let case_started = Instant::now();
+            let outcome = run_case(&case, timeout_ms, &mut timings);
+            let case_time = case_started.elapsed();
+            if !matches!(outcome, Outcome::Compared(..)) {
+                timings.failed_cases += case_time;
+            }
+            timings.slowest.push((case_time, index, case.query.clone()));
+            timings.slowest.sort_by(|a, b| b.0.cmp(&a.0));
+            timings.slowest.truncate(5);
+            match outcome {
                 Outcome::Compared(comparison, was_flaky) => {
                     compared += 1;
                     if was_flaky {
@@ -454,6 +511,23 @@ mod tests {
             flaky.len(),
             total as f64 / elapsed.max(1e-9),
         );
+        let secs = |d: Duration| d.as_secs_f64();
+        report += &format!(
+            "FUZZ timings_s generate={:.2} explain_on={:.2} explain_off={:.2} inner={:.2} server_reported={:.2} compare={:.2} failed_cases={:.2}\n",
+            secs(timings.generate),
+            secs(timings.explain_on),
+            secs(timings.explain_off),
+            secs(timings.inner),
+            secs(timings.server),
+            secs(timings.compare),
+            secs(timings.failed_cases),
+        );
+        for (time, index, query) in &timings.slowest {
+            report += &format!(
+                "FUZZ slowest {:.3}s index={index} query={query}\n",
+                secs(*time)
+            );
+        }
         report += &format!("FUZZ allowed {allowed:?}\n");
         report += &format!("FUZZ coverage {coverage:?}\n");
         for (message, (index, query)) in &error_samples {
