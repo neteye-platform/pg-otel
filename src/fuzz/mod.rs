@@ -10,7 +10,7 @@
 //!   reached first ends the run.
 //! * `PG_OTEL_FUZZ_CASE`: first case index to run (default 0). Alone it runs
 //!   exactly that case; with `PG_OTEL_FUZZ_CASES=n` it runs `n` cases from there.
-//! * `PG_OTEL_FUZZ_TIMEOUT_MS` (default 5000): time limit of a case.
+//! * `PG_OTEL_FUZZ_TIMEOUT_MS` (default 1000): time limit of a case.
 //!
 //! Case `i` runs with `case_seed(master, i)`; case 0 uses the master seed
 //! itself. Every failure line and the summary print the command that replays
@@ -392,7 +392,7 @@ mod tests {
         };
         let master = env_number("PG_OTEL_FUZZ_SEED")
             .expect("PG_OTEL_FUZZ_SEED is required when fuzzing (a replay uses the case seed)");
-        let timeout_ms = env_number("PG_OTEL_FUZZ_TIMEOUT_MS").unwrap_or(5000);
+        let timeout_ms = env_number("PG_OTEL_FUZZ_TIMEOUT_MS").unwrap_or(1000);
         let deadline = seconds.map(Duration::from_secs);
         log_line(&format!(
             "start master_seed={master} first_case={first_case} seconds={seconds:?} cases={cases:?} timeout_ms={timeout_ms} pg={}",
