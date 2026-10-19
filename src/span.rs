@@ -1,0 +1,1203 @@
+use std::{
+    ptr,
+    time::{Duration, SystemTime},
+};
+
+use opentelemetry::{
+    InstrumentationScope, KeyValue, SpanId, TraceFlags, TraceId,
+    propagation::{Extractor, TextMapPropagator},
+    trace::{SpanContext, SpanKind, Status, TraceContextExt, TraceState},
+};
+use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SpanData};
+use pgrx::pg_sys::{self, CmdType, PlanState, QueryDesc};
+
+use crate::{
+    compat::{self, NodeInstrument, NodeStats},
+    config::QueryTextMode,
+    planning::PlanningTiming,
+    postgres::plan_table_name,
+    sanitize,
+};
+
+/// Flags of every exported span. Spans are only collected when the trace is
+/// sampled (a remote parent with the sampled flag cleared suppresses
+/// collection entirely), so everything that reaches the exporter is sampled.
+const EXPORTED_TRACE_FLAGS: TraceFlags = TraceFlags::SAMPLED;
+
+/// Where the root span of a statement attaches to a trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParentContext {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    /// `true` when the parent was received from outside (traceparent), `false`
+    /// when this statement starts a new trace.
+    pub is_remote: bool,
+}
+
+impl ParentContext {
+    /// A statement without an incoming trace starts a new one: random
+    /// non-zero trace id and no parent span.
+    pub fn new_root() -> Self {
+        Self {
+            trace_id: random_trace_id(),
+            span_id: SpanId::INVALID,
+            is_remote: false,
+        }
+    }
+
+    /// Continues the trace described by `remote`.
+    pub fn from_remote(remote: &SpanContext) -> Self {
+        Self {
+            trace_id: remote.trace_id(),
+            span_id: remote.span_id(),
+            is_remote: true,
+        }
+    }
+}
+
+// Invariant for both generators below: `fastrand`'s thread-local generator is
+// seeded lazily on first use. It must never be used in the postmaster (before
+// fork), otherwise every backend would inherit the same state and produce
+// identical ids. Ids are only generated inside backends (executor hook).
+
+/// Random trace id; the all-zero id is invalid in W3C trace context.
+pub fn random_trace_id() -> TraceId {
+    loop {
+        let id = TraceId::from(fastrand::u128(..));
+        if id != TraceId::INVALID {
+            return id;
+        }
+    }
+}
+
+/// Random span id; the all-zero id is invalid in W3C trace context.
+pub fn random_span_id() -> SpanId {
+    loop {
+        let id = SpanId::from(fastrand::u64(..));
+        if id != SpanId::INVALID {
+            return id;
+        }
+    }
+}
+
+/// Longest query text exported, in bytes.
+pub const QUERY_TEXT_MAX_LEN: usize = 4096;
+/// Longest span name and relation name exported, in bytes.
+const NAME_MAX_LEN: usize = 256;
+
+/// A finished span as passed from backends to the exporter worker.
+///
+/// It owns its data; [`crate::codec`] turns it into the bytes that travel
+/// through the shared-memory queue and back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpanRecord {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    pub parent_id: SpanId,
+    pub name: String,
+    pub start_time: SystemTime,
+    pub end_time: SystemTime,
+    pub attributes: SpanAttributes,
+}
+
+/// What children of a span need to know about it.
+#[derive(Clone, Copy, Debug)]
+pub struct SpanLink {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    pub end_time: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryAttributes {
+    pub parent_is_remote: bool,
+    /// `SELECT`, `UPDATE`, ...
+    pub operation: String,
+    /// `None` when `pg_otel.query_text` is `off` or the text could not be
+    /// produced safely.
+    pub query_text: Option<String>,
+    /// Postgres' query id; `0` means it was not computed.
+    pub query_id: i64,
+    /// Time in ExecutorRun and ExecutorFinish.
+    pub exec_total_time_ns: i64,
+    /// Time in the planner; `None` when the statement was not planned in this
+    /// transaction (a re-executed cached plan) or planning was not measured.
+    pub planning_time_ns: Option<i64>,
+    /// Plan nodes without a span because `pg_otel.max_plan_spans` was reached;
+    /// `0` when the plan is complete.
+    pub plan_spans_omitted: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanNodeAttributes {
+    /// Debug name of the plan state node tag, e.g. `T_SeqScanState`.
+    pub node_type: String,
+    /// `schema.table` scanned by this node itself (not by its children).
+    pub relation: Option<String>,
+    /// EXPLAIN's "Parent Relationship"; `None` for the top plan node.
+    pub parent_relationship: Option<String>,
+    /// `InitPlan 1`, `SubPlan 2`, `CTE name`: set when this node is the root of
+    /// a sub-plan.
+    pub subplan_name: Option<String>,
+    /// Members of an Append/MergeAppend removed by run-time partition pruning;
+    /// `0` if none.
+    pub subplans_removed: u64,
+    /// Parallel workers launched, for Gather and GatherMerge.
+    pub workers_launched: Option<i64>,
+    /// The node never ran (`nloops == 0`), for example below a `LIMIT 0` or a
+    /// join with an empty side. Its timings and row counts are zero.
+    pub never_executed: bool,
+    /// The node had no usable instrumentation (it was interrupted while
+    /// running); its timings and row counts are zero and may be wrong.
+    pub instrumentation_incomplete: bool,
+    pub startup_cost: f64,
+    pub total_cost: f64,
+    pub rows: f64,
+    pub width_bytes: i32,
+    pub parallel_aware: bool,
+    pub parallel_safe: bool,
+    pub async_capable: bool,
+    pub instr_startup_time_ns: i64,
+    pub instr_total_time_ns: i64,
+    pub instr_rows: f64,
+    pub instr_secondary_rows: f64,
+    pub instr_loops: f64,
+    pub instr_rows_removed_by_scan_or_join_filter: f64,
+    pub instr_rows_removed_by_other_filter: f64,
+}
+
+/// The `planning` span: the planner's run, a child of the query span.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanningAttributes {
+    pub duration_ns: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SpanAttributes {
+    Planning(PlanningAttributes),
+    Query(QueryAttributes),
+    PlanNode(PlanNodeAttributes),
+}
+
+/// How a plan node hangs off its parent: EXPLAIN's "Parent Relationship".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Relationship {
+    Outer,
+    Inner,
+    InitPlan,
+    SubPlan,
+    /// A member of Append, MergeAppend, BitmapAnd or BitmapOr.
+    Member,
+    /// The sub-select of a SubqueryScan.
+    Subquery,
+    /// A child of a CustomScan.
+    Child,
+}
+
+impl Relationship {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Outer => "Outer",
+            Self::Inner => "Inner",
+            Self::InitPlan => "InitPlan",
+            Self::SubPlan => "SubPlan",
+            Self::Member => "Member",
+            Self::Subquery => "Subquery",
+            Self::Child => "Child",
+        }
+    }
+}
+
+/// The link between a plan node and its parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildEdge {
+    pub relationship: Relationship,
+    /// Display name when the node is the root of a sub-plan.
+    pub subplan_name: Option<String>,
+}
+
+impl ChildEdge {
+    pub fn new(relationship: Relationship) -> Self {
+        Self {
+            relationship,
+            subplan_name: None,
+        }
+    }
+}
+
+/// A child of a plan node, as found by the caller-supplied enumerator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanChild<N> {
+    pub node: N,
+    pub edge: ChildEdge,
+}
+
+/// What [`walk_plan`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkSummary {
+    /// Nodes for which `visit` returned a span.
+    pub emitted: usize,
+    /// Nodes left out because `max_spans` was reached.
+    pub omitted: usize,
+}
+
+/// Walks a plan tree depth-first, parents before children, siblings in the order
+/// `children_of` returns them (EXPLAIN's order).
+///
+/// The walk uses an explicit stack, so the depth of the plan cannot overflow
+/// the call stack.
+///
+/// `visit(node, edge, parent)` builds the span of `node`; `parent` is the link
+/// of the nearest ancestor that has a span (`None` for the root) and `edge`
+/// describes how the node hangs off its direct parent (`None` for the root).
+/// When `visit` returns `None` the node has no span and its children attach to
+/// that same ancestor.
+///
+/// After `max_spans` spans exist, `visit` is no longer called. The remaining
+/// nodes are still enumerated and counted in [`WalkSummary::omitted`], so a
+/// truncated tree always keeps a connected top part (depth-first order drops
+/// the last subtrees).
+pub fn walk_plan<N, L: Copy>(
+    root: N,
+    max_spans: usize,
+    mut children_of: impl FnMut(&N) -> Vec<PlanChild<N>>,
+    mut visit: impl FnMut(&N, Option<&ChildEdge>, Option<L>) -> Option<L>,
+) -> WalkSummary {
+    let mut summary = WalkSummary::default();
+    let mut stack = vec![(root, None::<ChildEdge>, None::<L>)];
+    while let Some((node, edge, parent)) = stack.pop() {
+        let link = if summary.emitted < max_spans {
+            visit(&node, edge.as_ref(), parent)
+        } else {
+            None
+        };
+        match link {
+            Some(_) => summary.emitted += 1,
+            None if summary.emitted >= max_spans => summary.omitted += 1,
+            None => {}
+        }
+        let children_parent = link.or(parent);
+        // Reversed so the first child is popped (visited) first.
+        for child in children_of(&node).into_iter().rev() {
+            stack.push((child.node, Some(child.edge), children_parent));
+        }
+    }
+    summary
+}
+
+/// The wall-clock layout of a statement's spans.
+///
+/// ```text
+/// query span   |<- planning ->|<- gap ->|<------ execution ------>|
+/// plan nodes                            |<- from exec_start ----->|
+/// ```
+///
+/// The gap is executor startup, and, with the extended protocol, the time
+/// between Bind (where the plan is made) and Execute. It belongs to the query
+/// span but to none of its children.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeline {
+    /// Start of the query span: the start of planning if it was measured,
+    /// otherwise `exec_start`.
+    pub query_start: SystemTime,
+    /// Start and end of the `planning` span, if planning was measured.
+    pub planning: Option<(SystemTime, SystemTime)>,
+    /// Start of execution; plan node spans start here.
+    pub exec_start: SystemTime,
+    /// End of the query span and of execution.
+    pub end: SystemTime,
+}
+
+impl Timeline {
+    /// Places planning before execution. `exec_start` is derived from the
+    /// monotonic execution time and the wall clock at the end, so tiny
+    /// inconsistencies between the clocks are possible; planning is clamped so
+    /// that it never overlaps or follows execution.
+    pub fn new(planning: Option<PlanningTiming>, exec_start: SystemTime, end: SystemTime) -> Self {
+        let planning = planning.map(|timing| {
+            let start = timing.start.min(exec_start);
+            let planning_end = (timing.start
+                + Duration::from_nanos(timing.duration_ns.max(0) as u64))
+            .min(exec_start)
+            .max(start);
+            (start, planning_end)
+        });
+        Self {
+            query_start: planning.map_or(exec_start, |(start, _)| start),
+            planning,
+            exec_start,
+            end,
+        }
+    }
+}
+
+impl SpanRecord {
+    /// The `planning` span, a child of the query span `query`.
+    pub fn planning(
+        query: &SpanLink,
+        (start_time, end_time): (SystemTime, SystemTime),
+        duration_ns: i64,
+    ) -> Self {
+        SpanRecord {
+            trace_id: query.trace_id,
+            span_id: random_span_id(),
+            parent_id: query.span_id,
+            name: "planning".to_owned(),
+            start_time,
+            end_time,
+            attributes: SpanAttributes::Planning(PlanningAttributes { duration_ns }),
+        }
+    }
+
+    pub fn link(&self) -> SpanLink {
+        SpanLink {
+            trace_id: self.trace_id,
+            span_id: self.span_id,
+            end_time: self.end_time,
+        }
+    }
+
+    /// The relation scanned by this plan node itself, if any.
+    pub fn relation(&self) -> Option<&str> {
+        match &self.attributes {
+            SpanAttributes::PlanNode(node) => node.relation.as_deref(),
+            SpanAttributes::Query(_) | SpanAttributes::Planning(_) => None,
+        }
+    }
+
+    /// Builds the span of a whole statement.
+    ///
+    /// The span covers the [`Timeline`]: from the start of planning (if it was
+    /// measured) to the end of execution, whose duration is the time Postgres
+    /// spent in ExecutorRun/Finish (see [`compat::query_total_ns`]). `span_id`
+    /// is chosen by the
+    /// caller so plan nodes can reference it as their parent before this span
+    /// exists, and `plan_spans_omitted` is the number of plan nodes left out of
+    /// the trace. Calls into Postgres to sanitize the query text, so it must not
+    /// run while the span queue lock is held.
+    pub fn from_query(
+        query_desc: *const QueryDesc,
+        timeline: &Timeline,
+        planning_time_ns: Option<i64>,
+        parent: &ParentContext,
+        query_text_mode: QueryTextMode,
+        span_id: SpanId,
+        plan_spans_omitted: usize,
+    ) -> Option<Self> {
+        let query_desc = unsafe { query_desc.as_ref()? };
+        // SAFETY: `query_desc` is valid in ExecutorEnd.
+        let total_ns = unsafe { compat::query_total_ns(query_desc)? };
+
+        let operation = query_name(query_desc.operation);
+        let (normalized_query, query_text, query_id) =
+            query_texts_and_id(query_desc, query_text_mode);
+        // The root span name is always normalized, even when `query_text` is
+        // raw or disabled, so span names cannot expose literal values.
+        let name = normalized_query
+            .as_deref()
+            .map(|query| truncated(query, NAME_MAX_LEN))
+            .unwrap_or_else(|| operation.to_owned());
+
+        Some(SpanRecord {
+            trace_id: parent.trace_id,
+            span_id,
+            parent_id: parent.span_id,
+            name,
+            start_time: timeline.query_start,
+            end_time: timeline.end,
+            attributes: SpanAttributes::Query(QueryAttributes {
+                parent_is_remote: parent.is_remote,
+                operation: operation.to_owned(),
+                query_text,
+                query_id,
+                exec_total_time_ns: total_ns,
+                planning_time_ns,
+                plan_spans_omitted: plan_spans_omitted as u64,
+            }),
+        })
+    }
+
+    /// Builds the span of one plan node.
+    ///
+    /// Postgres keeps no per-node wall-clock start (only accumulated durations),
+    /// so every node starts at the query start (`wall_start`) and ends after its
+    /// accumulated run time, capped at the end of its parent. `edge` says how the
+    /// node hangs off its parent (`None` for the top node).
+    ///
+    /// A node that never ran, or whose instrumentation is unusable, still gets
+    /// a span (so the tree keeps its shape) with zero timings and a flag
+    /// attribute saying why.
+    pub fn from_plan(
+        plan_node: *mut PlanState,
+        wall_start: SystemTime,
+        parent: &SpanLink,
+        edge: Option<&ChildEdge>,
+    ) -> Option<Self> {
+        let plan_node = unsafe { plan_node.as_ref() }?;
+        let plan = unsafe { plan_node.plan.as_ref() }?;
+        // SAFETY: the plan state is valid and not used by anyone else now.
+        let (timings, never_executed, incomplete) =
+            match unsafe { compat::node_instrument(plan_node) } {
+                NodeInstrument::Done(stats) => (stats, stats.loops == 0.0, false),
+                NodeInstrument::Incomplete => (NodeStats::default(), false, true),
+            };
+        let end_time =
+            (wall_start + Duration::from_nanos(timings.total_ns as u64)).min(parent.end_time);
+
+        let relation = plan_table_name(plan_node).map(|table| truncated(&table, NAME_MAX_LEN));
+        let table_suffix = relation
+            .as_deref()
+            .map(|table| format!(" [{table}]"))
+            .unwrap_or_default();
+        let node_type = format!("{:?}", plan_node.type_);
+        let subplan_name = edge.and_then(|edge| edge.subplan_name.clone());
+        let name = plan_span_name(subplan_name.as_deref(), &node_type, &table_suffix);
+
+        Some(SpanRecord {
+            trace_id: parent.trace_id,
+            span_id: random_span_id(),
+            parent_id: parent.span_id,
+            name: truncated(&name, NAME_MAX_LEN),
+            start_time: wall_start,
+            end_time,
+            attributes: SpanAttributes::PlanNode(PlanNodeAttributes {
+                node_type,
+                relation,
+                parent_relationship: edge.map(|edge| edge.relationship.as_str().to_owned()),
+                subplan_name,
+                subplans_removed: unsafe { pruned_member_count(plan_node, plan) },
+                workers_launched: unsafe { launched_workers(plan_node, plan) },
+                never_executed,
+                instrumentation_incomplete: incomplete,
+                startup_cost: plan.startup_cost,
+                total_cost: plan.total_cost,
+                rows: plan.plan_rows,
+                width_bytes: plan.plan_width,
+                parallel_aware: plan.parallel_aware,
+                parallel_safe: plan.parallel_safe,
+                async_capable: plan.async_capable,
+                instr_startup_time_ns: timings.startup_ns,
+                instr_total_time_ns: timings.total_ns,
+                instr_rows: timings.rows,
+                instr_secondary_rows: timings.secondary_rows,
+                instr_loops: timings.loops,
+                instr_rows_removed_by_scan_or_join_filter: timings.filtered_by_scan_or_join,
+                instr_rows_removed_by_other_filter: timings.filtered_by_other,
+            }),
+        })
+    }
+}
+
+/// `postgresql.operation.<node> [relation]`, prefixed with the sub-plan name
+/// (`InitPlan 1 → ...`) for the root of a sub-plan.
+fn plan_span_name(subplan_name: Option<&str>, node_type: &str, table_suffix: &str) -> String {
+    match subplan_name {
+        Some(subplan) => format!("{subplan} → postgresql.operation.{node_type}{table_suffix}"),
+        None => format!("postgresql.operation.{node_type}{table_suffix}"),
+    }
+}
+
+/// Members that run-time partition pruning removed from an Append or
+/// MergeAppend (EXPLAIN's "Subplans Removed").
+///
+/// # Safety
+///
+/// `plan_node` and `plan` must be a valid executor node and its plan.
+unsafe fn pruned_member_count(plan_node: &PlanState, plan: &pg_sys::Plan) -> u64 {
+    let (planned, live) = match plan.type_ {
+        // SAFETY: the plan tag says which concrete node types these are.
+        pg_sys::NodeTag::T_Append => unsafe {
+            let planned = list_length((*ptr::from_ref(plan).cast::<pg_sys::Append>()).appendplans);
+            let live = (*ptr::from_ref(plan_node).cast::<pg_sys::AppendState>()).as_nplans;
+            (planned, live)
+        },
+        pg_sys::NodeTag::T_MergeAppend => unsafe {
+            let planned =
+                list_length((*ptr::from_ref(plan).cast::<pg_sys::MergeAppend>()).mergeplans);
+            let live = (*ptr::from_ref(plan_node).cast::<pg_sys::MergeAppendState>()).ms_nplans;
+            (planned, live)
+        },
+        _ => return 0,
+    };
+    u64::try_from(planned.saturating_sub(live)).unwrap_or(0)
+}
+
+/// Number of workers a Gather or GatherMerge launched.
+///
+/// # Safety
+///
+/// As for [`pruned_member_count`].
+unsafe fn launched_workers(plan_node: &PlanState, plan: &pg_sys::Plan) -> Option<i64> {
+    // SAFETY: the plan tag says which concrete node type this is.
+    match plan.type_ {
+        pg_sys::NodeTag::T_Gather => Some(i64::from(unsafe {
+            (*ptr::from_ref(plan_node).cast::<pg_sys::GatherState>()).nworkers_launched
+        })),
+        pg_sys::NodeTag::T_GatherMerge => Some(i64::from(unsafe {
+            (*ptr::from_ref(plan_node).cast::<pg_sys::GatherMergeState>()).nworkers_launched
+        })),
+        _ => None,
+    }
+}
+
+/// Length of a Postgres `List` (`list_length` is a static inline function).
+fn list_length(list: *const pg_sys::List) -> i32 {
+    // SAFETY: a List pointer is null (empty) or points to a valid List.
+    unsafe { list.as_ref() }.map_or(0, |list| list.length)
+}
+
+/// `s` cut to at most `max_bytes` bytes on a character boundary.
+fn truncated(s: &str, max_bytes: usize) -> String {
+    sanitize::truncate_utf8(s, max_bytes).to_owned()
+}
+
+/// Normalized query text, exported query text, and query id.
+///
+/// Normalization is always attempted for the root span name. The exported text
+/// still follows `mode`: it can be the same normalized value, raw text, or be
+/// absent entirely.
+fn query_texts_and_id(
+    query_desc: &QueryDesc,
+    mode: QueryTextMode,
+) -> (Option<String>, Option<String>, i64) {
+    // SAFETY: `plannedstmt` is null or valid for the duration of the hook.
+    let (stmt_location, stmt_len, query_id) = match unsafe { query_desc.plannedstmt.as_ref() } {
+        Some(stmt) => (stmt.stmt_location, stmt.stmt_len, stmt.queryId),
+        None => (-1, 0, 0),
+    };
+    // SAFETY: `sourceText` is null or a NUL-terminated string that outlives
+    // the hook. `sanitize` truncates to `QUERY_TEXT_MAX_LEN`.
+    let normalized = unsafe {
+        sanitize::sanitize(
+            query_desc.sourceText,
+            stmt_location,
+            stmt_len,
+            true,
+            QUERY_TEXT_MAX_LEN,
+        )
+    };
+    let text = match mode {
+        QueryTextMode::Off => None,
+        QueryTextMode::Normalized => normalized.clone(),
+        // SAFETY: same source-text contract as above.
+        QueryTextMode::Raw => unsafe {
+            sanitize::sanitize(
+                query_desc.sourceText,
+                stmt_location,
+                stmt_len,
+                false,
+                QUERY_TEXT_MAX_LEN,
+            )
+        },
+    };
+    (normalized, text, query_id)
+}
+
+/// Seconds, for the `*_time_seconds` attributes.
+fn ns_to_seconds(ns: i64) -> f64 {
+    ns as f64 / 1e9
+}
+
+/// Microseconds, for `span.duration.us`.
+fn ns_to_micros(ns: i64) -> f64 {
+    ns as f64 / 1e3
+}
+
+fn query_name(command: CmdType::Type) -> &'static str {
+    match command {
+        CmdType::CMD_SELECT => "SELECT",
+        CmdType::CMD_UPDATE => "UPDATE",
+        CmdType::CMD_INSERT => "INSERT",
+        CmdType::CMD_DELETE => "DELETE",
+        CmdType::CMD_MERGE => "MERGE",
+        CmdType::CMD_UTILITY => "UTILITY",
+        CmdType::CMD_NOTHING => "NOTHING",
+        _ => "UNKNOWN",
+    }
+}
+
+impl From<SpanRecord> for SpanData {
+    fn from(span: SpanRecord) -> Self {
+        let span_context = SpanContext::new(
+            span.trace_id,
+            span.span_id,
+            EXPORTED_TRACE_FLAGS,
+            false,
+            TraceState::default(),
+        );
+
+        let instrumentation_scope = InstrumentationScope::builder("pg_otel")
+            .with_version(env!("CARGO_PKG_VERSION"))
+            .build();
+
+        // The whole span, which for a statement includes planning and the gaps.
+        let span_duration_ns = span
+            .end_time
+            .duration_since(span.start_time)
+            .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+
+        match span.attributes {
+            SpanAttributes::Planning(attr) => SpanData {
+                span_context,
+                parent_span_id: span.parent_id,
+                parent_span_is_remote: false,
+                span_kind: SpanKind::Internal,
+                name: span.name.into(),
+                start_time: span.start_time,
+                end_time: span.end_time,
+                attributes: vec![
+                    KeyValue::new("db.system.name", "postgresql"),
+                    KeyValue::new(
+                        "postgresql.planning.duration.us",
+                        ns_to_micros(attr.duration_ns),
+                    ),
+                    KeyValue::new("span.duration.us", ns_to_micros(span_duration_ns)),
+                    KeyValue::new("span.type", "db"),
+                    KeyValue::new("span.subtype", "planning"),
+                ],
+                dropped_attributes_count: 0,
+                events: Default::default(),
+                links: Default::default(),
+                status: Status::Ok,
+                instrumentation_scope,
+            },
+            SpanAttributes::Query(attr) => {
+                let mut attributes = vec![
+                    KeyValue::new("db.operation.name", attr.operation),
+                    KeyValue::new("db.system.name", "postgresql"),
+                    KeyValue::new(
+                        "postgresql.execution.total_time_seconds",
+                        ns_to_seconds(attr.exec_total_time_ns),
+                    ),
+                    KeyValue::new(
+                        "postgresql.execution.duration.us",
+                        ns_to_micros(attr.exec_total_time_ns),
+                    ),
+                    KeyValue::new("span.duration.us", ns_to_micros(span_duration_ns)),
+                    KeyValue::new("span.type", "db"),
+                    KeyValue::new("span.subtype", "postgresql"),
+                ];
+                if let Some(planning_ns) = attr.planning_time_ns {
+                    attributes.push(KeyValue::new(
+                        "postgresql.planning.duration.us",
+                        ns_to_micros(planning_ns),
+                    ));
+                }
+                if let Some(query_text) = attr.query_text {
+                    attributes.push(KeyValue::new("db.query.text", query_text));
+                }
+                if attr.query_id != 0 {
+                    attributes.push(KeyValue::new("db.query.id", attr.query_id));
+                }
+                if attr.plan_spans_omitted > 0 {
+                    attributes.push(KeyValue::new("postgresql.plan.spans_truncated", true));
+                    attributes.push(KeyValue::new(
+                        "postgresql.plan.spans_omitted",
+                        i64::try_from(attr.plan_spans_omitted).unwrap_or(i64::MAX),
+                    ));
+                }
+
+                SpanData {
+                    span_context,
+                    parent_span_id: span.parent_id,
+                    parent_span_is_remote: attr.parent_is_remote,
+                    span_kind: SpanKind::Server,
+                    name: span.name.into(),
+                    start_time: span.start_time,
+                    end_time: span.end_time,
+                    attributes,
+                    dropped_attributes_count: 0,
+                    events: Default::default(),
+                    links: Default::default(),
+                    status: Status::Ok,
+                    instrumentation_scope,
+                }
+            }
+            SpanAttributes::PlanNode(attr) => {
+                let mut attributes = vec![
+                    KeyValue::new("db.system.name", "postgresql"),
+                    KeyValue::new("postgresql.plan.node_type", attr.node_type),
+                ];
+                if let Some(relation) = attr.relation {
+                    attributes.push(KeyValue::new("postgresql.plan.relation", relation));
+                }
+                if let Some(relationship) = attr.parent_relationship {
+                    attributes.push(KeyValue::new(
+                        "postgresql.plan.parent_relationship",
+                        relationship,
+                    ));
+                }
+                if let Some(subplan_name) = attr.subplan_name {
+                    attributes.push(KeyValue::new("postgresql.plan.subplan_name", subplan_name));
+                }
+                if attr.subplans_removed > 0 {
+                    attributes.push(KeyValue::new(
+                        "postgresql.plan.subplans_removed",
+                        i64::try_from(attr.subplans_removed).unwrap_or(i64::MAX),
+                    ));
+                }
+                if let Some(workers) = attr.workers_launched {
+                    attributes.push(KeyValue::new("postgresql.plan.workers_launched", workers));
+                }
+                if attr.never_executed {
+                    attributes.push(KeyValue::new("postgresql.plan.never_executed", true));
+                }
+                if attr.instrumentation_incomplete {
+                    attributes.push(KeyValue::new(
+                        "postgresql.plan.instrumentation_incomplete",
+                        true,
+                    ));
+                }
+                attributes.extend([
+                    KeyValue::new("postgresql.plan.startup_cost", attr.startup_cost),
+                    KeyValue::new("postgresql.plan.total_cost", attr.total_cost),
+                    KeyValue::new("postgresql.plan.rows", attr.rows),
+                    KeyValue::new("postgresql.plan.width_bytes", attr.width_bytes as i64),
+                    KeyValue::new("postgresql.plan.parallel_aware", attr.parallel_aware),
+                    KeyValue::new("postgresql.plan.parallel_safe", attr.parallel_safe),
+                    KeyValue::new("postgresql.plan.async_capable", attr.async_capable),
+                    KeyValue::new(
+                        "postgresql.instrumentation.startup_time_seconds",
+                        ns_to_seconds(attr.instr_startup_time_ns),
+                    ),
+                    KeyValue::new(
+                        "postgresql.instrumentation.total_time_seconds",
+                        ns_to_seconds(attr.instr_total_time_ns),
+                    ),
+                    KeyValue::new("postgresql.instrumentation.rows", attr.instr_rows),
+                    KeyValue::new(
+                        "postgresql.instrumentation.secondary_rows",
+                        attr.instr_secondary_rows,
+                    ),
+                    KeyValue::new("postgresql.instrumentation.loops", attr.instr_loops),
+                    KeyValue::new(
+                        "postgresql.instrumentation.rows_removed_by_scan_or_join_filter",
+                        attr.instr_rows_removed_by_scan_or_join_filter,
+                    ),
+                    KeyValue::new(
+                        "postgresql.instrumentation.rows_removed_by_other_filter",
+                        attr.instr_rows_removed_by_other_filter,
+                    ),
+                    KeyValue::new("span.duration.us", ns_to_micros(attr.instr_total_time_ns)),
+                    KeyValue::new("span.type", "db"),
+                    KeyValue::new("span.subtype", "internal"),
+                ]);
+
+                SpanData {
+                    span_context,
+                    parent_span_id: span.parent_id,
+                    parent_span_is_remote: false,
+                    span_kind: SpanKind::Internal,
+                    name: span.name.into(),
+                    start_time: span.start_time,
+                    end_time: span.end_time,
+                    attributes,
+                    dropped_attributes_count: 0,
+                    events: Default::default(),
+                    links: Default::default(),
+                    status: Status::Ok,
+                    instrumentation_scope,
+                }
+            }
+        }
+    }
+}
+
+struct TraceParentExtractor<'a> {
+    parent: &'a str,
+}
+
+impl<'a> TraceParentExtractor<'a> {
+    pub fn new(parent: &'a str) -> Self {
+        Self { parent }
+    }
+}
+
+impl Extractor for TraceParentExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        if key.eq_ignore_ascii_case("traceparent") {
+            Some(self.parent)
+        } else {
+            None
+        }
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        vec!["traceparent"]
+    }
+}
+
+/// Parses a W3C `traceparent` header value.
+///
+/// Returns `None` unless the value is a valid trace context (well-formed, with
+/// non-zero trace and span ids), so callers can fall back to another source.
+pub fn parse_traceparent(s: &str) -> Option<SpanContext> {
+    // The propagator accepts hex fields of any length, so check the shape first.
+    if !has_traceparent_shape(s.trim()) {
+        return None;
+    }
+    let propagator = TraceContextPropagator::default();
+    let extractor = TraceParentExtractor::new(s);
+    let context = propagator.extract(&extractor).span().span_context().clone();
+    context.is_valid().then_some(context)
+}
+
+/// `version-traceid-spanid-flags` with fixed-width lowercase hex fields. Version
+/// `00` has no further fields; `ff` is forbidden; future versions may append
+/// fields after the four known ones.
+fn has_traceparent_shape(s: &str) -> bool {
+    fn is_hex(field: &str, len: usize) -> bool {
+        field.len() == len
+            && field
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    let parts: Vec<&str> = s.split('-').collect();
+    let [version, trace_id, span_id, flags, ..] = parts[..] else {
+        return false;
+    };
+    is_hex(version, 2)
+        && version != "ff"
+        && (version != "00" || parts.len() == 4)
+        && is_hex(trace_id, 32)
+        && is_hex(span_id, 16)
+        && is_hex(flags, 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    #[test]
+    fn parses_valid_sampled_traceparent() {
+        let context = parse_traceparent(VALID).expect("valid traceparent");
+        assert!(context.is_sampled());
+        assert_eq!(
+            context.trace_id(),
+            TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap()
+        );
+        assert_eq!(
+            context.span_id(),
+            SpanId::from_hex("00f067aa0ba902b7").unwrap()
+        );
+    }
+
+    #[test]
+    fn accepts_surrounding_whitespace_and_future_versions() {
+        assert!(parse_traceparent(&format!("  {VALID}\n")).is_some());
+        assert!(
+            parse_traceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-more")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn parses_unsampled_flag() {
+        let context =
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00").unwrap();
+        assert!(!context.is_sampled());
+    }
+
+    #[test]
+    fn rejects_invalid_traceparents() {
+        for invalid in [
+            "",
+            "garbage",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+            "00-4bf92f3577b34da6a3ce929d0e0e47-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba9-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e473é-00f067aa0ba902b7-01",
+        ] {
+            assert!(parse_traceparent(invalid).is_none(), "accepted {invalid:?}");
+        }
+    }
+
+    /// A plan tree for the walker tests: `children[n]` are the children of
+    /// node `n`.
+    struct TestPlan(Vec<Vec<(usize, Relationship, Option<&'static str>)>>);
+
+    impl TestPlan {
+        fn children(&self, node: usize) -> Vec<PlanChild<usize>> {
+            self.0[node]
+                .iter()
+                .map(|&(child, relationship, name)| PlanChild {
+                    node: child,
+                    edge: ChildEdge {
+                        relationship,
+                        subplan_name: name.map(str::to_owned),
+                    },
+                })
+                .collect()
+        }
+    }
+
+    /// (node, parent link, relationship) in visiting order.
+    type Visited = Vec<(usize, Option<usize>, Option<String>)>;
+
+    /// Visits every node; the "link" of a node is its own id.
+    fn walk(plan: &TestPlan, max_spans: usize) -> (Visited, WalkSummary) {
+        let mut visited = Vec::new();
+        let summary = walk_plan(
+            0,
+            max_spans,
+            |&node| plan.children(node),
+            |&node, edge, parent| {
+                let relationship = edge.map(|e| e.relationship.as_str().to_owned());
+                visited.push((node, parent, relationship));
+                Some(node)
+            },
+        );
+        (visited, summary)
+    }
+
+    #[test]
+    fn walk_is_depth_first_in_explain_order_with_parents() {
+        use Relationship::*;
+        //        0
+        //   InitPlan  Outer   Inner   SubPlan
+        //      1       2        3        4
+        //                      Member  Member
+        //                      5   6
+        let plan = TestPlan(vec![
+            vec![
+                (1, InitPlan, Some("InitPlan 1")),
+                (2, Outer, None),
+                (3, Inner, None),
+                (4, SubPlan, Some("SubPlan 2")),
+            ],
+            vec![],
+            vec![],
+            vec![(5, Member, None), (6, Member, None)],
+            vec![],
+            vec![],
+            vec![],
+        ]);
+        let (visited, summary) = walk(&plan, usize::MAX);
+        let order: Vec<_> = visited.iter().map(|v| v.0).collect();
+        assert_eq!(order, [0, 1, 2, 3, 5, 6, 4]);
+        let parents: Vec<_> = visited.iter().map(|v| v.1).collect();
+        assert_eq!(
+            parents,
+            [None, Some(0), Some(0), Some(0), Some(3), Some(3), Some(0)]
+        );
+        let relationships: Vec<_> = visited.iter().map(|v| v.2.as_deref()).collect();
+        assert_eq!(
+            relationships,
+            [
+                None,
+                Some("InitPlan"),
+                Some("Outer"),
+                Some("Inner"),
+                Some("Member"),
+                Some("Member"),
+                Some("SubPlan")
+            ]
+        );
+        assert_eq!(
+            summary,
+            WalkSummary {
+                emitted: 7,
+                omitted: 0
+            }
+        );
+    }
+
+    #[test]
+    fn walk_stops_emitting_at_the_cap_and_counts_the_rest() {
+        use Relationship::*;
+        let plan = TestPlan(vec![
+            vec![(1, Outer, None), (2, Inner, None)],
+            vec![(3, Outer, None)],
+            vec![(4, Outer, None)],
+            vec![],
+            vec![],
+        ]);
+        let (visited, summary) = walk(&plan, 3);
+        // Depth first: 0, 1, 3 are kept; 2 and 4 are dropped.
+        assert_eq!(visited.iter().map(|v| v.0).collect::<Vec<_>>(), [0, 1, 3]);
+        assert_eq!(
+            summary,
+            WalkSummary {
+                emitted: 3,
+                omitted: 2
+            }
+        );
+
+        let (visited, summary) = walk(&plan, 0);
+        assert!(visited.is_empty());
+        assert_eq!(
+            summary,
+            WalkSummary {
+                emitted: 0,
+                omitted: 5
+            }
+        );
+
+        let (_, summary) = walk(&plan, 5);
+        assert_eq!(
+            summary,
+            WalkSummary {
+                emitted: 5,
+                omitted: 0
+            }
+        );
+    }
+
+    #[test]
+    fn nodes_without_a_span_pass_their_ancestor_on_to_their_children() {
+        use Relationship::*;
+        let plan = TestPlan(vec![vec![(1, Outer, None)], vec![(2, Outer, None)], vec![]]);
+        let mut parents = Vec::new();
+        let summary = walk_plan(
+            0,
+            usize::MAX,
+            |&node| plan.children(node),
+            |&node, _edge, parent| {
+                parents.push((node, parent));
+                // Node 1 produces no span.
+                (node != 1).then_some(node)
+            },
+        );
+        assert_eq!(parents, [(0, None), (1, Some(0)), (2, Some(0))]);
+        assert_eq!(
+            summary,
+            WalkSummary {
+                emitted: 2,
+                omitted: 0
+            }
+        );
+    }
+
+    #[test]
+    fn very_deep_plans_do_not_overflow_the_stack() {
+        use Relationship::*;
+        const DEPTH: usize = 500_000;
+        let plan = TestPlan(
+            (0..DEPTH)
+                .map(|n| {
+                    if n + 1 < DEPTH {
+                        vec![(n + 1, Outer, None)]
+                    } else {
+                        vec![]
+                    }
+                })
+                .collect(),
+        );
+        let (visited, summary) = walk(&plan, usize::MAX);
+        assert_eq!(visited.len(), DEPTH);
+        assert_eq!(summary.emitted, DEPTH);
+        // The same chain with a cap keeps counting without recursion.
+        let (_, summary) = walk(&plan, 10);
+        assert_eq!(
+            summary,
+            WalkSummary {
+                emitted: 10,
+                omitted: DEPTH - 10
+            }
+        );
+    }
+
+    #[test]
+    fn relationship_names_match_explain() {
+        assert_eq!(Relationship::Outer.as_str(), "Outer");
+        assert_eq!(Relationship::Inner.as_str(), "Inner");
+        assert_eq!(Relationship::InitPlan.as_str(), "InitPlan");
+        assert_eq!(Relationship::SubPlan.as_str(), "SubPlan");
+        assert_eq!(Relationship::Member.as_str(), "Member");
+        assert_eq!(Relationship::Subquery.as_str(), "Subquery");
+    }
+
+    #[test]
+    fn plan_span_names_show_the_subplan_relationship() {
+        assert_eq!(
+            plan_span_name(None, "T_SeqScanState", " [public.t]"),
+            "postgresql.operation.T_SeqScanState [public.t]"
+        );
+        assert_eq!(
+            plan_span_name(Some("InitPlan 1"), "T_AggState", ""),
+            "InitPlan 1 → postgresql.operation.T_AggState"
+        );
+    }
+
+    fn at(ms: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(1_000_000 + ms)
+    }
+
+    fn timing(start_ms: u64, duration_ms: i64) -> PlanningTiming {
+        PlanningTiming {
+            start: at(start_ms),
+            duration_ns: duration_ms * 1_000_000,
+        }
+    }
+
+    #[test]
+    fn timeline_without_planning_starts_with_execution() {
+        let timeline = Timeline::new(None, at(10), at(20));
+        assert_eq!(timeline.query_start, at(10));
+        assert_eq!(timeline.planning, None);
+        assert_eq!((timeline.exec_start, timeline.end), (at(10), at(20)));
+    }
+
+    #[test]
+    fn timeline_starts_the_query_with_planning() {
+        let timeline = Timeline::new(Some(timing(0, 4)), at(10), at(20));
+        assert_eq!(timeline.query_start, at(0));
+        assert_eq!(timeline.planning, Some((at(0), at(4))));
+        assert_eq!(timeline.exec_start, at(10));
+    }
+
+    #[test]
+    fn timeline_never_lets_planning_overlap_execution() {
+        // Planning "ends" after execution started (clock inconsistency).
+        let timeline = Timeline::new(Some(timing(5, 20)), at(10), at(30));
+        assert_eq!(timeline.planning, Some((at(5), at(10))));
+        // Planning "starts" after execution started.
+        let timeline = Timeline::new(Some(timing(12, 3)), at(10), at(30));
+        assert_eq!(timeline.planning, Some((at(10), at(10))));
+        assert_eq!(timeline.query_start, at(10));
+        // A negative duration is treated as zero.
+        let timeline = Timeline::new(Some(timing(2, -5)), at(10), at(30));
+        assert_eq!(timeline.planning, Some((at(2), at(2))));
+    }
+
+    #[test]
+    fn duration_units_are_seconds_and_microseconds() {
+        assert_eq!(ns_to_seconds(1_500_000_000), 1.5);
+        assert_eq!(ns_to_micros(1_500_000), 1_500.0);
+        assert_eq!(ns_to_micros(0), 0.0);
+    }
+
+    #[test]
+    fn root_parent_is_new_local_trace() {
+        let root = ParentContext::new_root();
+        assert_ne!(root.trace_id, TraceId::INVALID);
+        assert_eq!(root.span_id, SpanId::INVALID);
+        assert!(!root.is_remote);
+    }
+
+    #[test]
+    fn remote_parent_keeps_ids_and_is_remote() {
+        let remote = parse_traceparent(VALID).unwrap();
+        let parent = ParentContext::from_remote(&remote);
+        assert_eq!(parent.trace_id, remote.trace_id());
+        assert_eq!(parent.span_id, remote.span_id());
+        assert!(parent.is_remote);
+    }
+
+    #[test]
+    fn random_ids_are_never_zero() {
+        for _ in 0..10_000 {
+            assert_ne!(random_span_id(), SpanId::INVALID);
+            assert_ne!(random_trace_id(), TraceId::INVALID);
+        }
+    }
+}
