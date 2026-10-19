@@ -43,6 +43,8 @@ jobs:
         run: cargo install --locked cargo-pgrx --version =0.19.1
       - name: Initialise pgrx against the system PostgreSQL
         run: cargo pgrx init --pg${{ matrix.pg }} "$PG_CONFIG"
+      - name: Let pgrx install the extension into the system PostgreSQL
+        run: sudo chown -R "$USER" "$("$PG_CONFIG" --sharedir)/extension" "$("$PG_CONFIG" --pkglibdir)"
       - name: Run unit and pg_test tests
         env:
           PGRX_PG_CONFIG_PATH: ${{ env.PG_CONFIG }}
