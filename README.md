@@ -366,3 +366,20 @@ Plans with more than `pg_otel.max_plan_spans` nodes are cut off (see
 This was developed on top of the shoulders of [pgrx](https://github.com/pgcentralfoundation/pgrx)
 Without it, this plugin would not have been possible at this quality and in
 this short time (for me at least).
+
+## Integration tests
+
+`tests/integration` exports spans from a real PostgreSQL server to a real
+OpenTelemetry collector (gRPC and HTTP) and checks what the collector wrote.
+Locally everything runs in containers, with the extension built inside the
+PostgreSQL image so that it matches the server's glibc:
+
+```sh
+scripts/integration-tests.sh                 # PostgreSQL 18, podman or docker
+PG_MAJOR=19 scripts/integration-tests.sh     # another major version
+scripts/integration-tests.sh --keep          # leave the containers up to debug
+```
+
+The tests are `#[ignore]`d, so a plain `cargo test` does not need containers.
+CI runs the same tests against the runner's PostgreSQL and a collector
+container.

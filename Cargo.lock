@@ -1454,6 +1454,8 @@ dependencies = [
  "pgrx",
  "pgrx-bench",
  "pgrx-tests",
+ "postgres",
+ "serde_json",
  "tokio",
  "tonic",
 ]
