@@ -202,7 +202,7 @@ impl Generator {
             21 => format!("SELECT {t0}.* FROM {from}{where_} ORDER BY {t0}.{}, {t0}.id DESC LIMIT {}", TABLES[tables[0]].1[1], self.0.u32(1..=500)),
             22 => format!("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < {}) SELECT r.n, {first} FROM r JOIN {from} ON r.n = {first}{and_} true", self.0.u32(1..=200)),
             23 => format!("SELECT * FROM (VALUES (1, 'x'), ({m}, 'y'), (3, 'z')) AS v(i, s) JOIN a ON a.id = v.i"),
-            24 => format!("SELECT g, {first} FROM generate_series(1, {}) g JOIN {from} ON {first} = g{and_} true", self.0.u32(1..=500)),
+            24 => format!("SELECT s.g, {first} FROM generate_series(1, {}) s(g) JOIN {from} ON {first} = s.g{and_} true", self.0.u32(1..=500)),
             25 => format!("SELECT generate_series(1, {t0}.id % {}) FROM {from}{where_}", self.0.u32(2..=5)),
             26 => format!("SELECT * FROM {} {t0} WHERE {} FOR UPDATE", TABLES[tables[0]].0, self.predicate(t0, tables[0])),
             27 => format!("SELECT * FROM a WHERE ctid = '(0,{})'", self.0.u32(1..=20)),
@@ -211,7 +211,7 @@ impl Generator {
             30 => format!("SELECT {}", self.pick(&["1", "now() > now()", "(SELECT 1)"])),
             31 => format!("SELECT * FROM a WHERE {} AND false", self.predicate("a", 0)),
             // Initial partition pruning (the bound is only known at executor start).
-            32 | 33 => format!("SELECT {} FROM p WHERE id {} (SELECT {})", *self.pick(&["count(*)", "id", "g, count(*) GROUP BY g"]), *self.pick(&["<", ">", "="]), self.0.u32(0..=3000)),
+            32 | 33 => format!("SELECT {} FROM p WHERE id {} (SELECT {})", *self.pick(&["count(*)", "id", "g"]), *self.pick(&["<", ">", "="]), self.0.u32(0..=3000)),
             34 => format!("SELECT * FROM p ORDER BY id LIMIT {}", self.0.u32(1..=2000)),
             35 => format!("SELECT * FROM p WHERE g = {} ORDER BY id", self.0.u32(0..=4)),
             36 => format!("SELECT {t0}.id, x.m FROM {from}, LATERAL (SELECT max(c.v) AS m FROM c WHERE c.b_id = {t0}.id) x{where_}"),
@@ -235,7 +235,7 @@ impl Generator {
             5 => format!("DELETE FROM p WHERE g = {}", self.0.u32(0..=4)),
             6 => format!("UPDATE a SET k = k + 1 FROM b WHERE b.a_id = a.id AND b.g = {}", self.0.u32(0..=12)),
             7 => format!("MERGE INTO c USING b ON c.id = b.id WHEN MATCHED AND c.v < {v} THEN UPDATE SET v = c.v + 1 WHEN NOT MATCHED AND b.g = 1 THEN INSERT VALUES (b.id, b.g, b.a_id)"),
-            _ => format!("INSERT INTO p SELECT id + 5000, g FROM p WHERE id < {}", self.0.u32(1..=3000)),
+            _ => format!("INSERT INTO p SELECT id, g FROM p WHERE id < {}", self.0.u32(1..=3000)),
         }
     }
 }

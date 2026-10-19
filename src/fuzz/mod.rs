@@ -81,6 +81,13 @@ fn log_line(message: &str) {
     log!("TMSG: FUZZ {message}");
 }
 
+/// Like [`log_line`] for text that already starts with `FUZZ` on each line.
+fn log_report(report: &str) {
+    for line in report.lines() {
+        log!("TMSG: {line}");
+    }
+}
+
 /// Runs `f` in a subtransaction that is always rolled back, and catches any
 /// error it raises.
 fn rolled_back<T>(f: impl FnOnce() -> T) -> Result<T, String> {
@@ -283,9 +290,8 @@ mod tests {
         if findings.len() > MAX_REPORTED {
             report += &format!("FUZZ ... and {} more classes\n", findings.len() - MAX_REPORTED);
         }
-        log_line(&report);
-        assert!(findings.is_empty(), "\n{report}");
-        eprintln!("{report}");
+        log_report(&report);
+        assert!(findings.is_empty(), "{} mismatch classes, see the FUZZ lines above", findings.len());
     }
 
     /// Replaying a case seed must give the same case, and the first case of a

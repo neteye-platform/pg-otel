@@ -42,7 +42,7 @@ pub struct Comparison {
 fn is_allowed(mismatch: &Mismatch) -> bool {
     // Tracked as "ModifyTable plan node spans have no postgresql.plan.relation": ModifyTable spans have no
     // `postgresql.plan.relation`.
-    mismatch.kind == "relation" && matches!(mismatch.node.as_str(), "Insert" | "Update" | "Delete" | "Merge")
+    mismatch.kind == "relation" && mismatch.node == "ModifyTable"
 }
 
 fn attr<'a>(span: &'a SpanData, key: &str) -> Option<&'a Value> {
@@ -74,7 +74,7 @@ fn span_node_type(explain: &str) -> String {
         "Aggregate" => "Agg",
         "Nested Loop" => "NestLoop",
         "Materialize" => "Material",
-        "Insert" | "Update" | "Delete" | "Merge" => "ModifyTable",
+        "CTE Scan" => "CteScan",
         other => return format!("T_{}State", other.replace(' ', "")),
     };
     format!("T_{name}State")
