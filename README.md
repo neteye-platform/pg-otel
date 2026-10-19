@@ -184,11 +184,12 @@ Query span attributes:
 | `span.duration.us` | The same duration in **microseconds**. |
 
 Plan node spans carry `db.system.name`, `postgresql.plan.*` (planner estimates
-and `postgresql.plan.relation`, the `schema.table` this node itself scans, if
-any) and `postgresql.instrumentation.*` (actual rows, loops, filtered rows,
-startup and total time in seconds) attributes, plus `span.duration.us` in
-microseconds. The query span's name is the normalized statement, cut to 256
-bytes.
+and `postgresql.plan.relation`, the `schema.table` this node itself scans, or
+for a `ModifyTable` node the table it writes to (the parent for partitioned
+targets), if any) and `postgresql.instrumentation.*` (actual rows, loops,
+filtered rows, startup and total time in seconds) attributes, plus
+`span.duration.us` in microseconds. The query span's name is the normalized
+statement, cut to 256 bytes.
 
 Attributes that describe how a plan node fits into the plan (present when they
 apply):
@@ -227,7 +228,7 @@ If you have dashboards or alerts on earlier versions of this extension:
 | `db.statement` | `db.query.text` (sanitized according to `pg_otel.query_text`) |
 | `db.system` | `db.system.name` (current OpenTelemetry semantic conventions) |
 | `db.operation` | `db.operation.name` |
-| `postgresql.plan.tables` (list of all relations below the node) | `postgresql.plan.relation` (only the node's own relation) |
+| `postgresql.plan.tables` (list of all relations below the node) | `postgresql.plan.relation` (only the node's own relation or, for `ModifyTable`, its target) |
 | `postgresql.execution.startup_time_seconds` | removed (it was always 0) |
 | `span.duration.us` | now really microseconds (it used to be off by a factor of 1000 or 1e6) |
 | span timestamps and durations | converted from Postgres' clock ticks to nanoseconds (they were wrong on machines where the ticks are not nanoseconds) |
