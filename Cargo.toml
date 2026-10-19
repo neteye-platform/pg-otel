@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 default = ["pg19"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18" ]
 pg19 = ["pgrx/pg19", "pgrx-tests/pg19" ]
-pg_test = []
+pg_test = ["dep:serde_json"]
 pg_bench = ["dep:pgrx-bench"]
 
 [dependencies]
@@ -20,6 +20,7 @@ tonic = { version = "0.14.6", features = ["tls-ring"] }
 pgrx = "=0.19.1"
 tokio = { version = "1.52.3", features = ["rt", "time"] }
 fastrand = "2.4.1"
+serde_json = { version = "1.0.154", optional = true } # only for the fuzzer, via `pg_test`
 
 [dependencies.opentelemetry-otlp]
 version = "0.32.0"
