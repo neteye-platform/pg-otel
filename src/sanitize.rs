@@ -295,7 +295,7 @@ fn scan_tokens(sql: &CStr) -> Option<Vec<Token>> {
     let mut valid = true;
 
     // SAFETY: `sql` is NUL-terminated; `extra` outlives the scanner and is
-    // only used through it. The keyword tables are Postgres' own statics, as
+    // only used through it. The keyword tables are Postgres' own static tables, as
     // required by `scanner_init`.
     let scanner = unsafe {
         pg_sys::scanner_init(

@@ -38,14 +38,14 @@ escalates beyond a normal error cannot be contained.
 To enable the plugin, you need to add it to your PostgreSQL configuration file.
 Add the following line to your `postgresql.conf` file:
 
-```
+```ini
 shared_preload_libraries = 'pg_otel.so'
 ```
 
 Then you can point it to the OpenTelemetry collector endpoint using the
 `pg_otel` GUCs:
 
-```
+```ini
 pg_otel.otlp_endpoint = 'https://localhost:4317'
 pg_otel.otlp_protocol = 'grpc' # supports grpc or http/protobuf
 pg_otel.otlp_timeout_ms = 5000
@@ -361,9 +361,8 @@ and relation names are truncated to 256 bytes and the query text to 4096 bytes.
 Plans with more than `pg_otel.max_plan_spans` nodes are cut off (see
 [Large plans](#large-plans)).
 
-
 ## Acknowledgements
 
-This was developed ontop of the shoulders of [pgrx](https://github.com/pgcentralfoundation/pgrx)
+This was developed on top of the shoulders of [pgrx](https://github.com/pgcentralfoundation/pgrx)
 Without it, this plugin would not have been possible at this quality and in
 this short time (for me at least).

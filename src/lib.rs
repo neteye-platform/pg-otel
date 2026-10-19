@@ -30,7 +30,7 @@ const WORKER_NAME: &str = "pg_otel exporter";
 /// Postgres restarts the worker this long after it crashed or exited.
 const WORKER_RESTART_TIME: Duration = Duration::from_secs(10);
 
-// This is a global variable accross all plugins. We store the previous hook so we can execute it before our
+// This is a global variable across all plugins. We store the previous hook so we can execute it before our
 // own hook. This is important because we want to make sure that the previous hook is executed before our own
 // hook, so that we don't break any existing functionality.
 static mut PREV_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
