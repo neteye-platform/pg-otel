@@ -244,7 +244,10 @@ mod tests {
                     generator_errors += 1;
                     error_samples.entry(message).or_insert((index, case.query.clone()));
                 }
-                Outcome::GeneratorTimeout => generator_timeouts += 1,
+                Outcome::GeneratorTimeout => {
+                    generator_timeouts += 1;
+                    error_samples.entry("timeout with the plugin on and off".to_owned()).or_insert((index, case.query.clone()));
+                }
                 Outcome::PluginOnly(message) => {
                     found.push((format!("plugin_only_failure: {message}"), vec![message]));
                 }
