@@ -23,8 +23,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install PostgreSQL 18 server headers
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-server-dev-18 libclang-dev
       - name: Install stable Rust toolchain
         run: rustup toolchain install stable --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run unit tests
-        run: cargo test --workspace --locked --all-targets
+        env:
+          PGRX_PG_CONFIG_PATH: /usr/lib/postgresql/18/bin/pg_config
+        run: cargo test --workspace --locked --all-targets --no-default-features --features pg18
