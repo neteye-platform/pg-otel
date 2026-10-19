@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::OnceLock, time::Duration};
 
 use pgrx::{
     bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags},
@@ -30,16 +30,24 @@ const WORKER_NAME: &str = "pg_otel exporter";
 /// Postgres restarts the worker this long after it crashed or exited.
 const WORKER_RESTART_TIME: Duration = Duration::from_secs(10);
 
-// This is a global variable across all plugins. We store the previous hook so we can execute it before our
-// own hook. This is important because we want to make sure that the previous hook is executed before our own
-// hook, so that we don't break any existing functionality.
-static mut PREV_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
-// Same, but for ExecutorEnd_hook
-static mut PREV_EXECUTOR_END: pg_sys::ExecutorEnd_hook_type = None;
+/// The `ExecutorStart_hook` / `ExecutorEnd_hook` that were installed before
+/// ours. Hooks form a chain: each one must call its predecessor (or the
+/// standard function when there is none), or other extensions would break.
+/// Set exactly once, in `_PG_init` (single-threaded, in the postmaster, before
+/// any hook can run), and only read afterwards, hence no `static mut`.
+/// See <https://www.postgresql.org/docs/current/xfunc-c.html>.
+static PREV_EXECUTOR_START: OnceLock<pg_sys::ExecutorStart_hook_type> = OnceLock::new();
+static PREV_EXECUTOR_END: OnceLock<pg_sys::ExecutorEnd_hook_type> = OnceLock::new();
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
-    if unsafe { !pgrx::pg_sys::process_shared_preload_libraries_in_progress } {
+    // SAFETY: plain read of a `bool` global that the postmaster sets while it
+    // loads `shared_preload_libraries`; `_PG_init` runs on that single thread,
+    // so nothing writes it concurrently. It is false when the library is loaded
+    // any other way (`LOAD`, `CREATE EXTENSION`, session_preload_libraries):
+    // <https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/init/miscinit.c>
+    let preloading = unsafe { pg_sys::process_shared_preload_libraries_in_progress };
+    if !preloading {
         pgrx::error!("this extension must be loaded via shared_preload_libraries.");
     }
     ExporterConfig::define_gucs();
@@ -55,22 +63,37 @@ pub extern "C-unwind" fn _PG_init() {
         .set_restart_time(Some(WORKER_RESTART_TIME))
         .load();
 
-    // SAFETY: This is called once by postgres
-    unsafe {
-        PREV_EXECUTOR_START = pg_sys::ExecutorStart_hook;
-        pg_sys::ExecutorStart_hook = Some(my_executor_start_hook);
-        PREV_EXECUTOR_END = pg_sys::ExecutorEnd_hook;
-        pg_sys::ExecutorEnd_hook = Some(my_executor_end_hook);
-    }
+    // SAFETY: `_PG_init` runs once per process, single-threaded, before any
+    // query executes, so nothing reads or writes the hook globals concurrently.
+    let prev_start = unsafe { pg_sys::ExecutorStart_hook };
+    // SAFETY: same single-threaded `_PG_init` context for this hook global.
+    let prev_end = unsafe { pg_sys::ExecutorEnd_hook };
+    assert!(
+        PREV_EXECUTOR_START.set(prev_start).is_ok() && PREV_EXECUTOR_END.set(prev_end).is_ok(),
+        "executor hooks installed twice"
+    );
+    // SAFETY: same single-threaded context; the hook has the signature
+    // `ExecutorStart_hook_type` (see executor.h).
+    unsafe { pg_sys::ExecutorStart_hook = Some(my_executor_start_hook) };
+    // SAFETY: same single-threaded context; the hook has the signature
+    // `ExecutorEnd_hook_type` (see executor.h).
+    unsafe { pg_sys::ExecutorEnd_hook = Some(my_executor_end_hook) };
 }
 
 /// Rejects unknown `pg_otel.*` settings (typos in `postgresql.conf`) instead of
 /// silently accepting them as placeholders.
 fn reserve_guc_prefix() {
-    // SAFETY: called from `_PG_init` after all `pg_otel.*` GUCs are defined.
+    // SAFETY: the argument is a static NUL-terminated string (Postgres copies
+    // it). Called from `_PG_init` after all `pg_otel.*` GUCs are defined, as
+    // required: <https://www.postgresql.org/docs/current/xfunc-c.html>
     unsafe { pg_sys::MarkGUCPrefixReserved(c"pg_otel".as_ptr()) };
 }
 
+// `no_mangle`: the postmaster resolves the worker entry point by name
+// (`bgw_function_name` = "background_worker_main", `bgw_library_name` =
+// "pg_otel") with `load_external_function()`, i.e. `dlsym`, so the symbol must
+// keep its exact name:
+// <https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/postmaster/bgworker.c>
 #[pg_guard]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
@@ -93,7 +116,10 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
     // until the next server start). During a server shutdown the postmaster
     // does not restart workers; it only logs the exit code. `proc_exit` runs
     // the exit callbacks that unregister the worker.
-    // SAFETY: called from the worker's main function at the end of its life.
+    // SAFETY: `proc_exit` never returns; it runs the registered exit callbacks.
+    // Called from the worker's main function at the end of its life, which is
+    // where a background worker is supposed to exit:
+    // <https://www.postgresql.org/docs/current/bgworker.html>
     unsafe { pg_sys::proc_exit(1) };
 }
 
@@ -103,6 +129,10 @@ fn pg_otel_dropped_spans() -> i64 {
     i64::try_from(shared::dropped_spans()).unwrap_or(i64::MAX)
 }
 
+/// # Safety
+///
+/// Must only be called by Postgres as `ExecutorStart_hook`: `query_desc` points
+/// to a valid, exclusively owned `QueryDesc` (executor.h).
 #[pg_guard]
 unsafe extern "C-unwind" fn my_executor_start_hook(
     query_desc: *mut pg_sys::QueryDesc,
@@ -110,35 +140,49 @@ unsafe extern "C-unwind" fn my_executor_start_hook(
 ) {
     // Does nothing when tracing is disabled, in parallel workers, or for
     // EXPLAIN without ANALYZE.
-    request_instrumentation(query_desc, eflags);
+    // SAFETY: `query_desc` is the valid `QueryDesc` Postgres passed to this
+    // hook; ExecutorStart has not run yet, which is the phase this needs.
+    unsafe { request_instrumentation(query_desc, eflags) };
 
-    // SAFETY: I am trusting the docs on this one.
-    unsafe {
-        if let Some(prev) = PREV_EXECUTOR_START {
-            prev(query_desc, eflags);
-        } else {
-            pg_sys::standard_ExecutorStart(query_desc, eflags);
-        }
+    // `PREV_EXECUTOR_START` is set in `_PG_init`, before this hook is installed.
+    if let Some(Some(prev)) = PREV_EXECUTOR_START.get().copied() {
+        // SAFETY: chained hook, called with the arguments our caller (Postgres)
+        // gave us, per the hook contract. See executor.h, `ExecutorStart_hook`.
+        unsafe { prev(query_desc, eflags) };
+    } else {
+        // SAFETY: `query_desc` and `eflags` come straight from Postgres, as for
+        // the chained hook; this is what Postgres itself calls with no hook.
+        unsafe { pg_sys::standard_ExecutorStart(query_desc, eflags) };
     }
 
     // PG18 can only allocate the statement timer once the executor state
     // exists; a no-op on PG19.
-    complete_instrumentation_request(query_desc, eflags);
+    // SAFETY: `query_desc` is still the valid `QueryDesc` passed to this hook,
+    // and ExecutorStart has just returned (or this is the PG19 no-op).
+    unsafe { complete_instrumentation_request(query_desc, eflags) };
 }
 
+/// # Safety
+///
+/// Must only be called by Postgres as `ExecutorEnd_hook`: `query_desc` points
+/// to a valid `QueryDesc` that was started (executor.h).
 #[pg_guard]
 unsafe extern "C-unwind" fn my_executor_end_hook(query_desc: *mut pg_sys::QueryDesc) {
     // Never raises: telemetry failures are contained so the previous / standard
     // ExecutorEnd below always runs. Parallel workers are skipped inside.
-    collect_spans(query_desc);
+    // SAFETY: `query_desc` is the valid, started `QueryDesc` Postgres passed to
+    // this hook; ExecutorEnd has not run yet, so its plan state is still intact.
+    unsafe { collect_spans(query_desc) };
 
-    // SAFETY: I am trusting the docs on this one.
-    unsafe {
-        if let Some(prev) = PREV_EXECUTOR_END {
-            prev(query_desc);
-        } else {
-            pg_sys::standard_ExecutorEnd(query_desc);
-        }
+    // `PREV_EXECUTOR_END` is set in `_PG_init`, before this hook is installed.
+    if let Some(Some(prev)) = PREV_EXECUTOR_END.get().copied() {
+        // SAFETY: chained hook, called with the argument Postgres gave us, per
+        // the hook contract. See executor.h, `ExecutorEnd_hook`.
+        unsafe { prev(query_desc) };
+    } else {
+        // SAFETY: `query_desc` comes straight from Postgres, as for the chained
+        // hook; this is what Postgres itself calls with no hook.
+        unsafe { pg_sys::standard_ExecutorEnd(query_desc) };
     }
 }
 

@@ -34,10 +34,11 @@ fn tracing_enabled(min_duration_ms: i32, parallel_worker_number: i32) -> bool {
 }
 
 pub(crate) fn tracing_enabled_here() -> bool {
-    // SAFETY: plain reads of backend-local variables.
-    tracing_enabled(get_min_duration_ms(), unsafe {
-        pg_sys::ParallelWorkerNumber
-    })
+    // SAFETY: `ParallelWorkerNumber` is a plain `int` set once at backend
+    // start; each backend is single-threaded, so the read cannot race.
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/transam/parallel.c
+    let parallel_worker_number = unsafe { pg_sys::ParallelWorkerNumber };
+    tracing_enabled(get_min_duration_ms(), parallel_worker_number)
 }
 
 /// `EXPLAIN` without `ANALYZE` plans and starts the executor but never runs
@@ -56,16 +57,23 @@ fn wants_instrumentation(query_desc: *mut pg_sys::QueryDesc, eflags: i32) -> boo
 ///
 /// Does nothing when tracing is disabled or for `EXPLAIN` without `ANALYZE`,
 /// so such statements pay no instrumentation overhead.
-pub fn request_instrumentation(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+///
+/// # Safety
+///
+/// `query_desc` must be null or point to a valid `QueryDesc` in
+/// `ExecutorStart`, before `standard_ExecutorStart` runs.
+pub unsafe fn request_instrumentation(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
     if !query_desc.is_null() && is_explain_only(eflags) {
         // A plan that is only explained is never executed, so nothing would
         // ever consume its planning time; drop it so it cannot be attached to
         // a later, unrelated plan.
-        // SAFETY: non-null `query_desc` of the statement about to start.
+        // SAFETY: `query_desc` is non-null (checked above) and, in
+        // ExecutorStart, valid for the whole call.
         let _ = unsafe { planning::take_for(query_desc) };
     }
     if wants_instrumentation(query_desc, eflags) {
-        // SAFETY: non-null `query_desc` of the statement about to start.
+        // SAFETY: `query_desc` is non-null (`wants_instrumentation`) and
+        // valid in ExecutorStart, before `standard_ExecutorStart` runs.
         unsafe { compat::request_instrumentation_before_start(query_desc) };
     }
 }
@@ -73,9 +81,15 @@ pub fn request_instrumentation(query_desc: *mut pg_sys::QueryDesc, eflags: i32) 
 /// The part of the instrumentation request that only works once the executor
 /// state exists (statement timing on PG18). Call after `ExecutorStart`, with the
 /// same arguments as [`request_instrumentation`].
-pub fn complete_instrumentation_request(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+///
+/// # Safety
+///
+/// `query_desc` must be null or point to a valid `QueryDesc` whose
+/// `standard_ExecutorStart` has returned.
+pub unsafe fn complete_instrumentation_request(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
     if wants_instrumentation(query_desc, eflags) {
-        // SAFETY: non-null `query_desc` whose ExecutorStart has completed.
+        // SAFETY: `query_desc` is non-null (`wants_instrumentation`) and valid;
+        // `standard_ExecutorStart` has returned, so `estate` exists.
         unsafe { compat::request_instrumentation_after_start(query_desc) };
     }
 }
@@ -90,19 +104,32 @@ pub fn complete_instrumentation_request(query_desc: *mut pg_sys::QueryDesc, efla
 ///
 /// This is best-effort containment: errors that Postgres escalates (`FATAL`,
 /// `PANIC`) or that leave shared state inconsistent cannot be contained.
-pub fn collect_spans(query_desc: *mut pg_sys::QueryDesc) {
-    // SAFETY: only reads a global; restored below because an error may leave
-    // Postgres in a different memory context.
+///
+/// # Safety
+///
+/// `query_desc` must be null or point to a valid `QueryDesc` in `ExecutorEnd`,
+/// before `standard_ExecutorEnd` frees its executor state, and nothing may
+/// mutate it during the call.
+pub unsafe fn collect_spans(query_desc: *mut pg_sys::QueryDesc) {
+    // SAFETY: reads a backend-local global (single-threaded backend, no race).
+    // Restored below because a caught error may leave Postgres in another
+    // memory context.
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/mmgr/mcxt.c
     let saved_context = unsafe { pg_sys::CurrentMemoryContext };
-    PgTryBuilder::new(AssertUnwindSafe(|| collect_spans_unguarded(query_desc)))
-        .catch_when(PgSqlErrorCode::ERRCODE_QUERY_CANCELED, |error| {
-            error.rethrow()
-        })
-        .catch_others(|error| {
-            report_collection_failure(&error);
-        })
-        .execute();
-    // SAFETY: `saved_context` was current when we started and is still alive.
+    // SAFETY: `query_desc` is valid per the function contract.
+    PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
+        collect_spans_unguarded(query_desc)
+    }))
+    .catch_when(PgSqlErrorCode::ERRCODE_QUERY_CANCELED, |error| {
+        error.rethrow()
+    })
+    .catch_others(|error| {
+        report_collection_failure(&error);
+    })
+    .execute();
+    // SAFETY: writes a backend-local global. `saved_context` is the caller's
+    // context, current when we started and still alive: nothing in this
+    // function deletes it.
     unsafe { pg_sys::CurrentMemoryContext = saved_context };
 }
 
@@ -123,24 +150,31 @@ fn report_collection_failure(error: &pgrx::pg_sys::panic::CaughtError) {
     }
 }
 
-fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
+/// # Safety
+///
+/// As for [`collect_spans`].
+unsafe fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
     if query_desc.is_null() {
         return;
     }
     // Consume the planning time of this plan before any early return, so it can
     // never be attached to another statement later.
-    // SAFETY: non-null `query_desc` in ExecutorEnd.
+    // SAFETY: `query_desc` is non-null (checked above) and valid in ExecutorEnd.
     let planning = unsafe { planning::take_for(query_desc) };
     if !tracing_enabled_here() {
         return;
     }
     fault::inject();
 
-    // SAFETY: `query_desc` is non-null and valid for the duration of the hook;
-    // `estate` is set by ExecutorStart.
-    let explain_only = unsafe {
-        let estate = (*query_desc).estate;
-        !estate.is_null() && is_explain_only((*estate).es_top_eflags)
+    // SAFETY: `query_desc` is non-null and valid in ExecutorEnd; the field is
+    // read through the raw pointer, no reference is created.
+    let estate = unsafe { (*query_desc).estate };
+    let explain_only = !estate.is_null() && {
+        // SAFETY: non-null `estate` set by ExecutorStart; it is freed only by
+        // `standard_ExecutorEnd`, which has not run yet.
+        // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/execMain.c
+        let eflags = unsafe { (*estate).es_top_eflags };
+        is_explain_only(eflags)
     };
     if explain_only {
         return;
@@ -151,8 +185,11 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
     // ExecutorRun and ExecutorFinish (not ExecutorStart/End). There is none when
     // instrumentation was not requested (tracing was disabled at ExecutorStart).
     let end_time = SystemTime::now();
-    // SAFETY: `query_desc` is non-null and valid in ExecutorEnd.
-    let Some(exec_ns) = (unsafe { compat::query_total_ns(&*query_desc) }) else {
+    // SAFETY: `query_desc` is non-null and valid in ExecutorEnd. The shared
+    // reference only lives for this call; nothing mutates the QueryDesc.
+    let query_desc_ref = unsafe { &*query_desc };
+    // SAFETY: valid `QueryDesc` in ExecutorEnd.
+    let Some(exec_ns) = (unsafe { compat::query_total_ns(query_desc_ref) }) else {
         return;
     };
     let planning_ns = planning.map(|timing| timing.duration_ns);
@@ -165,7 +202,12 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
     let exec_start = end_time - Duration::from_nanos(exec_ns as u64);
     let timeline = Timeline::new(planning, exec_start, end_time);
 
-    let source_text = pg_str(unsafe { (*query_desc).sourceText });
+    // SAFETY: valid `query_desc` (see above); raw field read.
+    let source_text_ptr = unsafe { (*query_desc).sourceText };
+    // SAFETY: null or NUL-terminated, owned by the portal/plan cache, and not
+    // freed or modified before `standard_ExecutorEnd`. `source_text` is last
+    // used by `decide_parent` below, and no memory context is reset between.
+    let source_text = unsafe { pg_str(source_text_ptr) };
     let guc_traceparent = get_otlp_traceparent();
     let parent = match decide_parent(guc_traceparent.as_deref(), source_text.as_deref()) {
         TraceDecision::Skip => return,
@@ -181,6 +223,8 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
         span_id: query_span_id,
         end_time: timeline.end,
     };
+    // SAFETY: valid `query_desc` (see above); raw field read. `planstate` is
+    // null or the executor tree, alive until `standard_ExecutorEnd`.
     let planstate = unsafe { (*query_desc).planstate };
     let PlanSpans { mut spans, omitted } = collect_plan_spans(
         planstate,
@@ -198,15 +242,20 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
         ));
     }
 
-    let Some(query_span) = SpanRecord::from_query(
-        query_desc,
-        &timeline,
-        planning_ns,
-        &parent,
-        get_query_text_mode(),
-        query_span_id,
-        omitted,
-    ) else {
+    // SAFETY: `query_desc` is valid in ExecutorEnd and nothing mutates it
+    // during the call.
+    let query_span = unsafe {
+        SpanRecord::from_query(
+            query_desc,
+            &timeline,
+            planning_ns,
+            &parent,
+            get_query_text_mode(),
+            query_span_id,
+            omitted,
+        )
+    };
+    let Some(query_span) = query_span else {
         return;
     };
     spans.push(query_span);
@@ -229,9 +278,9 @@ fn meets_slow_query_threshold(duration_ns: i64, min_duration_ms: i32) -> bool {
 ///
 /// Encoding happens first, without any lock; the queue lock is then held only
 /// for a single memory copy. Never call Postgres code while holding that lock:
-/// if the code raised an ERROR that we catch, the LWLock would leak (pgrx and
-/// [`shared`] only release it on unwind when InterruptHoldoffCount is
-/// non-zero), and every later publish would hang.
+/// if the code raised an ERROR that we catch, the LWLock would leak (the guard
+/// in [`shared`] releases it on unwind only if `LWLockHeldByMe` says this
+/// backend still holds it), and every later publish would hang.
 fn publish_spans(spans: Vec<SpanRecord>) {
     let Some(spans) = capture::divert(spans) else {
         return;
@@ -272,10 +321,15 @@ fn collect_plan_spans(
     let summary = walk_plan(
         planstate,
         max_spans,
-        // SAFETY: nodes come from the executor tree of the finished statement.
+        // SAFETY: nodes come from the executor tree of the finished statement,
+        // which is alive and unmodified until `standard_ExecutorEnd`.
         |&node| unsafe { plan_state_children(node, &mut printed_subplans) },
         |&node, edge, parent| {
-            let span = SpanRecord::from_plan(node, wall_start, &parent.unwrap_or(*query), edge)?;
+            // SAFETY: each node is a valid, idle executor node of the finished
+            // statement (executor tree alive until `standard_ExecutorEnd`).
+            let span = unsafe {
+                SpanRecord::from_plan(node, wall_start, &parent.unwrap_or(*query), edge)
+            }?;
             let link = span.link();
             result.spans.push(span);
             Some(link)
@@ -303,55 +357,103 @@ unsafe fn plan_state_children(
     node: *mut pg_sys::PlanState,
     printed_subplans: &mut HashSet<i32>,
 ) -> Vec<PlanChild<*mut pg_sys::PlanState>> {
+    // All fields are read through raw places: a `&PlanState` would only have
+    // provenance for the `PlanState` header, and the casts below reach into
+    // the larger concrete state structs that embed it as their first field
+    // (https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/nodes/execnodes.h).
+    // Which concrete struct it is follows from the plan's `NodeTag`, like in
+    // `planstate_tree_walker`:
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/nodes/nodeFuncs.c
     let mut children = Vec::new();
-    // SAFETY: valid per the function contract; the tag of the plan says which
-    // concrete state type `node` is embedded in, as in Postgres' own walker.
+    // SAFETY: `node` is valid (function contract); raw field read.
+    let init_plan = unsafe { (*node).initPlan };
+    // SAFETY: `node` is valid (function contract); raw field read.
+    let left = unsafe { (*node).lefttree };
+    // SAFETY: `node` is valid (function contract); raw field read.
+    let right = unsafe { (*node).righttree };
+    // SAFETY: `node` is valid (function contract); raw field read.
+    let sub_plan = unsafe { (*node).subPlan };
+    // SAFETY: `node` is valid (function contract); raw field read.
+    let plan = unsafe { (*node).plan };
+    // SAFETY: `initPlan` is NIL or a valid `List` of `SubPlanState`s.
     unsafe {
-        let state = &*node;
         push_subplans(
             &mut children,
-            state.initPlan,
+            init_plan,
             Relationship::InitPlan,
             printed_subplans,
         );
-        push_child(&mut children, state.lefttree, Relationship::Outer);
-        push_child(&mut children, state.righttree, Relationship::Inner);
+    }
+    push_child(&mut children, left, Relationship::Outer);
+    push_child(&mut children, right, Relationship::Inner);
 
-        if let Some(plan) = state.plan.as_ref() {
-            match plan.type_ {
-                pg_sys::NodeTag::T_Append => {
-                    let append = &*node.cast::<pg_sys::AppendState>();
-                    push_members(&mut children, append.appendplans, append.as_nplans);
-                }
-                pg_sys::NodeTag::T_MergeAppend => {
-                    let merge = &*node.cast::<pg_sys::MergeAppendState>();
-                    push_members(&mut children, merge.mergeplans, merge.ms_nplans);
-                }
-                pg_sys::NodeTag::T_BitmapAnd => {
-                    let bitmap = &*node.cast::<pg_sys::BitmapAndState>();
-                    push_members(&mut children, bitmap.bitmapplans, bitmap.nplans);
-                }
-                pg_sys::NodeTag::T_BitmapOr => {
-                    let bitmap = &*node.cast::<pg_sys::BitmapOrState>();
-                    push_members(&mut children, bitmap.bitmapplans, bitmap.nplans);
-                }
-                pg_sys::NodeTag::T_SubqueryScan => {
-                    let scan = &*node.cast::<pg_sys::SubqueryScanState>();
-                    push_child(&mut children, scan.subplan, Relationship::Subquery);
-                }
-                pg_sys::NodeTag::T_CustomScan => {
-                    let custom = &*node.cast::<pg_sys::CustomScanState>();
-                    for child in list_pointers::<pg_sys::PlanState>(custom.custom_ps) {
-                        push_child(&mut children, child, Relationship::Child);
-                    }
-                }
-                _ => {}
+    let tag = if plan.is_null() {
+        None
+    } else {
+        // SAFETY: non-null `plan` of an initialised node; raw read of the tag.
+        Some(unsafe { (*plan).type_ })
+    };
+    match tag {
+        Some(pg_sys::NodeTag::T_Append) => {
+            let append = node.cast::<pg_sys::AppendState>();
+            // SAFETY: the tag says `node` is an `AppendState`, fully allocated.
+            let plans = unsafe { (*append).appendplans };
+            // SAFETY: same `append` state struct as the previous read.
+            let count = unsafe { (*append).as_nplans };
+            // SAFETY: `appendplans` holds `as_nplans` valid pointers
+            // (`ExecInitAppend`, nodeAppend.c).
+            unsafe { push_members(&mut children, plans, count) };
+        }
+        Some(pg_sys::NodeTag::T_MergeAppend) => {
+            let merge = node.cast::<pg_sys::MergeAppendState>();
+            // SAFETY: the tag says `node` is a `MergeAppendState`.
+            let plans = unsafe { (*merge).mergeplans };
+            // SAFETY: same `merge` state struct as the previous read.
+            let count = unsafe { (*merge).ms_nplans };
+            // SAFETY: `mergeplans` holds `ms_nplans` valid pointers.
+            unsafe { push_members(&mut children, plans, count) };
+        }
+        Some(pg_sys::NodeTag::T_BitmapAnd) => {
+            let bitmap = node.cast::<pg_sys::BitmapAndState>();
+            // SAFETY: the tag says `node` is a `BitmapAndState`.
+            let plans = unsafe { (*bitmap).bitmapplans };
+            // SAFETY: same `bitmap` state struct as the previous read.
+            let count = unsafe { (*bitmap).nplans };
+            // SAFETY: `bitmapplans` holds `nplans` valid pointers.
+            unsafe { push_members(&mut children, plans, count) };
+        }
+        Some(pg_sys::NodeTag::T_BitmapOr) => {
+            let bitmap = node.cast::<pg_sys::BitmapOrState>();
+            // SAFETY: the tag says `node` is a `BitmapOrState`.
+            let plans = unsafe { (*bitmap).bitmapplans };
+            // SAFETY: same `bitmap` state struct as the previous read.
+            let count = unsafe { (*bitmap).nplans };
+            // SAFETY: `bitmapplans` holds `nplans` valid pointers.
+            unsafe { push_members(&mut children, plans, count) };
+        }
+        Some(pg_sys::NodeTag::T_SubqueryScan) => {
+            let scan = node.cast::<pg_sys::SubqueryScanState>();
+            // SAFETY: the tag says `node` is a `SubqueryScanState`.
+            let subplan = unsafe { (*scan).subplan };
+            push_child(&mut children, subplan, Relationship::Subquery);
+        }
+        Some(pg_sys::NodeTag::T_CustomScan) => {
+            let custom = node.cast::<pg_sys::CustomScanState>();
+            // SAFETY: the tag says `node` is a `CustomScanState`.
+            let custom_ps = unsafe { (*custom).custom_ps };
+            // SAFETY: `custom_ps` is NIL or a `List` of `PlanState` pointers.
+            for child in unsafe { list_pointers::<pg_sys::PlanState>(custom_ps) } {
+                push_child(&mut children, child, Relationship::Child);
             }
         }
+        _ => {}
+    }
 
+    // SAFETY: `subPlan` is NIL or a valid `List` of `SubPlanState`s.
+    unsafe {
         push_subplans(
             &mut children,
-            state.subPlan,
+            sub_plan,
             Relationship::SubPlan,
             printed_subplans,
         );
@@ -384,12 +486,11 @@ unsafe fn push_members(
         return;
     }
     for index in 0..usize::try_from(count).unwrap_or(0) {
-        // SAFETY: `index < count` per the function contract.
-        push_child(
-            children,
-            unsafe { *members.add(index) },
-            Relationship::Member,
-        );
+        // SAFETY: `index < count`, so the slot is inside the array.
+        let slot = unsafe { members.add(index) };
+        // SAFETY: the slot is initialised and aligned (function contract).
+        let member = unsafe { *slot };
+        push_child(children, member, Relationship::Member);
     }
 }
 
@@ -404,12 +505,18 @@ unsafe fn push_subplans(
     relationship: Relationship,
     printed_subplans: &mut HashSet<i32>,
 ) {
-    // SAFETY: per the function contract.
+    // SAFETY: NIL or a valid `List` of `SubPlanState` pointers (contract).
     for subplan_state in unsafe { list_pointers::<pg_sys::SubPlanState>(list) } {
+        // SAFETY: each element is null or a valid `SubPlanState` built by
+        // `ExecInitSubPlan` in the executor's memory context, alive until
+        // `standard_ExecutorEnd`; the shared reference is only used to read
+        // fields in this iteration while nothing mutates the tree.
+        // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/nodeSubplan.c
         let Some(subplan_state) = (unsafe { subplan_state.as_ref() }) else {
             continue;
         };
-        // SAFETY: a SubPlanState points to its SubPlan.
+        // SAFETY: `subplan` points to the `SubPlan` plan expression node,
+        // read-only and alive as long as the plan tree.
         let Some(subplan) = (unsafe { subplan_state.subplan.as_ref() }) else {
             continue;
         };
@@ -431,24 +538,48 @@ unsafe fn push_subplans(
 ///
 /// # Safety
 ///
-/// `list` must be null or a valid `List` holding `*mut T` pointers.
+/// `list` must be null or a valid `List` holding `*mut T` pointers
+/// (`T_List`, not `T_IntList`/`T_OidList`), unmodified during the call.
 unsafe fn list_pointers<T>(list: *mut pg_sys::List) -> Vec<*mut T> {
-    // SAFETY: per the function contract.
-    let Some(list) = (unsafe { list.as_ref() }) else {
+    if list.is_null() {
         return Vec::new();
-    };
-    (0..usize::try_from(list.length).unwrap_or(0))
-        // SAFETY: `elements` has `length` valid cells for a non-empty list.
-        .map(|index| unsafe { (*list.elements.add(index)).ptr_value.cast::<T>() })
-        .collect()
+    }
+    // `List` is a header followed by a cell array that `elements` points to
+    // (https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/nodes/pg_list.h);
+    // fields are read through the raw pointer, no `&List` is created.
+    // SAFETY: `list` is non-null and valid (function contract).
+    let length = unsafe { (*list).length };
+    // SAFETY: `list` is non-null and valid (function contract).
+    let elements = unsafe { (*list).elements };
+    let mut pointers = Vec::new();
+    for index in 0..usize::try_from(length).unwrap_or(0) {
+        // SAFETY: `elements` has `length` cells, `index < length`.
+        let cell = unsafe { elements.add(index) };
+        // SAFETY: `cell` is in bounds (above), so the place expression stays
+        // inside the allocation; no reference or read is made here.
+        let slot = unsafe { &raw const (*cell).ptr_value };
+        // SAFETY: the cell is initialised; a pointer list stores `ptr_value`.
+        let pointer = unsafe { slot.read() };
+        pointers.push(pointer.cast::<T>());
+    }
+    pointers
 }
 
-pub fn plan_table_name(state: *const pg_sys::PlanState) -> Option<String> {
+/// Name of the table a scan node reads, `schema.table`, or `None` for other
+/// nodes.
+///
+/// # Safety
+///
+/// `state` must point to a valid, initialised plan state that is the header
+/// of its concrete state struct, in a live transaction (catalog lookups).
+pub unsafe fn plan_table_name(state: *const pg_sys::PlanState) -> Option<String> {
+    // SAFETY: `state` is valid (function contract); raw field read.
     let plan = unsafe { (*state).plan };
     if plan.is_null() {
         return None;
     }
 
+    // SAFETY: non-null `plan` of an initialised node; raw read of the tag.
     let node_type = unsafe { (*plan).type_ };
     let is_scan = matches!(
         node_type,
@@ -474,34 +605,70 @@ pub fn plan_table_name(state: *const pg_sys::PlanState) -> Option<String> {
         return None;
     }
 
-    // All PostgreSQL scan-state structs embed ScanState as their first field.
-    let scan_state = state as *const pg_sys::ScanState;
+    // Every scan-state struct embeds `ScanState` as its first field
+    // (https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/nodes/execnodes.h).
+    // The field is read through the raw pointer: no reference is created, so
+    // there is no provenance problem for the larger concrete struct.
+    let scan_state = state.cast::<pg_sys::ScanState>();
+    // SAFETY: the tag is a scan type, so `state` is a fully allocated scan state.
     let relation = unsafe { (*scan_state).ss_currentRelation };
     if relation.is_null() {
         return None;
     }
 
-    plan_table_identifier(unsafe { (*relation).rd_id })
+    // SAFETY: non-null open `Relation`, kept open by the executor until
+    // `standard_ExecutorEnd`; raw read of `rd_id`.
+    let oid = unsafe { (*relation).rd_id };
+    // SAFETY: syscache lookups need a live transaction (function contract).
+    unsafe { plan_table_identifier(oid) }
 }
 
-pub fn plan_table_identifier(oid: Oid) -> Option<String> {
+/// `schema.table` (just `table` when the schema is unknown) for a relation.
+///
+/// # Safety
+///
+/// Must run in a backend with a live transaction (syscache access), without
+/// holding a lock that Postgres code could wait for.
+pub unsafe fn plan_table_identifier(oid: Oid) -> Option<String> {
+    // SAFETY: plain syscache lookup, returns `InvalidOid` if unknown.
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/cache/lsyscache.c
     let namespace_oid = unsafe { pg_sys::get_rel_namespace(oid) };
-    let relation_name = unsafe { pg_str(pg_sys::get_rel_name(oid)) }?;
-    let namespace_name = unsafe { pg_str(pg_sys::get_namespace_name_or_temp(namespace_oid)) };
+    // SAFETY: returns null or a `palloc`ed string in `CurrentMemoryContext`,
+    // which no one resets before `pg_str` copies it below.
+    let relation_name_ptr = unsafe { pg_sys::get_rel_name(oid) };
+    // SAFETY: null or NUL-terminated (see above); copied by `into_owned`
+    // before any other Postgres call. Leaks until the context is reset.
+    let relation_name = unsafe { pg_str(relation_name_ptr) }?.into_owned();
+    // SAFETY: same contract as `get_rel_name`.
+    let namespace_name_ptr = unsafe { pg_sys::get_namespace_name_or_temp(namespace_oid) };
+    // SAFETY: null or NUL-terminated from `get_namespace_name_or_temp`;
+    // copied into an owned `String` immediately.
+    let namespace_name = unsafe { pg_str(namespace_name_ptr) }.map(Cow::into_owned);
 
     Some(match namespace_name {
         Some(namespace_name) => format!("{namespace_name}.{relation_name}"),
-        None => relation_name.into_owned(),
+        None => relation_name,
     })
 }
 
 /// Reads a NUL-terminated string from Postgres, replacing invalid UTF-8 with
 /// U+FFFD. Returns `None` for a null pointer.
-pub fn pg_str<'a>(s: *const i8) -> Option<Cow<'a, str>> {
+///
+/// The result borrows the string with an unbounded lifetime, so callers must
+/// not keep it past the string's life; convert with `into_owned` before
+/// resetting or deleting the memory context it was allocated in
+/// (<https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/mmgr/README>).
+///
+/// # Safety
+///
+/// `s` must be null or point to a NUL-terminated string that stays valid and
+/// unmodified for as long as the returned value is used.
+pub unsafe fn pg_str<'a>(s: *const i8) -> Option<Cow<'a, str>> {
     if s.is_null() {
         return None;
     }
-    // SAFETY: non-null; Postgres strings are NUL-terminated and outlive the hook.
+    // SAFETY: non-null and NUL-terminated (function contract); the borrow ends
+    // with the returned value.
     let cstr = unsafe { CStr::from_ptr(s) };
     Some(cstr.to_string_lossy())
 }
