@@ -36,8 +36,16 @@ version = "=0.19.1"
 optional = true
 
 [dev-dependencies]
+postgres = "0.19.14"
+serde_json = "1.0.154"
+
 [dev-dependencies.pgrx-tests]
 version = "=0.19.1"
+
+# Needs a running PostgreSQL and OpenTelemetry collector, see tests/integration.
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
 
 [profile.dev]
 panic = "unwind"

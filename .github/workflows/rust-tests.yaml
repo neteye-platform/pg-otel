@@ -49,3 +49,37 @@ jobs:
         env:
           PGRX_PG_CONFIG_PATH: ${{ env.PG_CONFIG }}
         run: cargo test --workspace --locked --all-targets --no-default-features --features pg${{ matrix.pg }}
+      # Runs in this job to reuse the build cache of the steps above. PostgreSQL
+      # is the runner's own, so the extension and server share one glibc; only
+      # the collector is a container. See tests/integration and
+      # scripts/integration-tests.sh for the local, fully containerised setup.
+      - name: Install the extension into the system PostgreSQL
+        run: cargo pgrx install --pg-config "$PG_CONFIG" --no-default-features --features pg${{ matrix.pg }}
+      - name: Start PostgreSQL
+        run: |
+          pgdata="$RUNNER_TEMP/pgdata"
+          "$(dirname "$PG_CONFIG")/initdb" -D "$pgdata" -A trust -U postgres
+          "$(dirname "$PG_CONFIG")/pg_ctl" -D "$pgdata" -l "$RUNNER_TEMP/postgres.log" -w \
+            -o "-p 5432 -c unix_socket_directories=$RUNNER_TEMP -c shared_preload_libraries=pg_otel" start
+      - name: Start the OpenTelemetry collector
+        run: |
+          mkdir -p "$RUNNER_TEMP/collector-out"
+          docker run -d --name collector --network host --user "$(id -u)" \
+            -v "$PWD/tests/integration/collector.yaml:/etc/otelcol/config.yaml:ro" \
+            -v "$RUNNER_TEMP/collector-out:/out" \
+            docker.io/otel/opentelemetry-collector:0.163.1 --config /etc/otelcol/config.yaml
+      - name: Run integration tests
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGDATABASE: postgres
+          COLLECTOR_HOST: localhost
+        run: |
+          export COLLECTOR_OUT_DIR="$RUNNER_TEMP/collector-out"
+          cargo test --locked --test integration --no-default-features --features pg${{ matrix.pg }} -- --include-ignored
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          docker logs collector || true
+          cat "$RUNNER_TEMP/postgres.log" || true
