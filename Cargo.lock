@@ -1448,6 +1448,7 @@ name = "pg_otel"
 version = "0.2.0"
 dependencies = [
  "fastrand",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
