@@ -66,9 +66,12 @@ use pgrx::{PgMemoryContexts, PgTryBuilder, pg_sys};
 
 // Token codes of the core scanner. They are not part of the pgrx bindings
 // because they live in the bison-generated `gram.h`. `parser/scanner.h`
-// guarantees these come first in every grammar built on the core scanner
-// (`IDENT = 258` and so on), so the numbers are stable across Postgres versions;
-// the values below were taken from the PG19 `gram.h`.
+// requires every grammar built on the core scanner to declare these tokens first,
+// in this order (`IDENT UIDENT FCONST SCONST USCONST BCONST XCONST Op ICONST
+// PARAM`): <https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/parser/scanner.h>.
+// Bison numbers tokens from 258, so `FCONST = 260` .. `PARAM = 267` on PG18
+// (`gram.y`, `%token <str> IDENT ...`) and PG19 alike. The `token_kinds_match_the_scanner`
+// test checks the values against the real scanner.
 const FCONST: c_int = 260;
 const SCONST: c_int = 261;
 const USCONST: c_int = 262;
@@ -148,14 +151,22 @@ pub unsafe fn current_statement(
     if source_text.is_null() {
         return None;
     }
-    // SAFETY: non-null and NUL-terminated per the function contract.
+    // SAFETY: non-null (checked above) and NUL-terminated per the function
+    // contract, and valid for the whole call. `bytes` borrows it only inside this
+    // function (the lifetime is not unbounded: it ends at return), and nothing
+    // mutates the string meanwhile (`CleanQuerytext` below only reads it).
+    // `CStr::from_ptr` reads up to the first NUL, i.e. `strlen(source_text)` bytes.
     let bytes = unsafe { CStr::from_ptr(source_text) }.to_bytes();
     let (mut location, mut len) = validated_range(bytes.len(), stmt_location, stmt_len)?;
 
     // CleanQuerytext only trims; it needs `location <= strlen` and
     // `len <= strlen - location`, which `validated_range` guarantees.
-    // SAFETY: the pointer is valid per the function contract.
-    let _ = unsafe { pg_sys::CleanQuerytext(source_text, &mut location, &mut len) };
+    // SAFETY: `source_text` is a valid NUL-terminated string (function
+    // contract), and `location`/`len` are in range (see above). `CleanQuerytext`
+    // only reads the string and adjusts the two out-parameters through pointers
+    // that are valid, aligned and exclusive for the call. It never raises an
+    // error: <https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/nodes/queryjumblefuncs.c>
+    let _ = unsafe { pg_sys::CleanQuerytext(source_text, &raw mut location, &raw mut len) };
 
     let range = location as usize..(location + len) as usize;
     let statement = String::from_utf8_lossy(bytes.get(range)?);
@@ -197,7 +208,8 @@ pub fn normalize(sql: &str) -> Option<String> {
 }
 
 fn server_encoding_is_utf8() -> bool {
-    // SAFETY: plain getter of a backend-local variable.
+    // SAFETY: plain getter of a backend-local variable
+    // (<https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/mb/mbutils.c>); no error path.
     unsafe { pg_sys::GetDatabaseEncoding() == pg_sys::pg_enc::PG_UTF8 as c_int }
 }
 
@@ -215,6 +227,29 @@ fn server_encoding_is_utf8() -> bool {
 /// side-effect free and cannot fail. The trade-off is that the GUC machinery
 /// does not know about the change, so it must always be reverted before control
 /// returns to Postgres, which `Drop` guarantees.
+///
+/// # Soundness
+///
+/// * Postgres backends are single threaded and the variables are plain
+///   `int`s read by `elog.c` (`should_output_to_client`, `is_log_level_output`)
+///   only on this thread, so there is no data race.
+/// * Only usable in a backend, after startup (`MyBackendType` set), i.e. in
+///   hooks and SQL functions, never in `_PG_init` of the postmaster.
+/// * Unwinding: `Drop` runs when a Rust panic or a pgrx-converted ERROR unwinds
+///   through the guard. [`lex`] contains the scan's errors with `PgTryBuilder`,
+///   so they never unwind past it anyway.
+/// * `longjmp`: a raw `longjmp` over this frame would skip `Drop`, leaving the
+///   levels raised. That cannot happen: the guard's lifetime spans only code
+///   that either is pure Rust or runs inside [`PgTryBuilder`]/`pg_guard`, which
+///   catch the `longjmp` before it crosses the guard.
+/// * A GUC reload (`SIGHUP`, `ProcessConfigFile`) is only processed at safe
+///   points (`CHECK_FOR_INTERRUPTS`/main loop), which the scanner never reaches.
+///   Were `log_min_messages` to be reassigned during the guard, `Drop` would
+///   restore the old value; harmless because the window is a single scan.
+///
+/// See <https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/error/elog.c> and
+/// <https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/utils/guc.h>. The two variables differ per version: see
+/// [`crate::compat::log_min_messages_slot`].
 struct MessageSuppression {
     client_min_messages: c_int,
     log_min_messages: c_int,
@@ -224,44 +259,59 @@ impl MessageSuppression {
     const LEVEL: c_int = pgrx::PgLogLevel::ERROR as c_int;
 
     fn new() -> Self {
-        // SAFETY: backend-local GUC variables, only touched by this backend.
-        unsafe {
-            let saved = Self {
-                client_min_messages: pg_sys::client_min_messages,
-                log_min_messages: Self::log_min_messages(),
-            };
-            pg_sys::client_min_messages = saved.client_min_messages.max(Self::LEVEL);
-            Self::set_log_min_messages(saved.log_min_messages.max(Self::LEVEL));
-            saved
-        }
+        // SAFETY: backend-local GUC variable, only touched by this thread.
+        let client_min_messages = unsafe { pg_sys::client_min_messages };
+        // SAFETY: called in a backend (see "Soundness").
+        let log_min_messages = unsafe { Self::log_min_messages() };
+        let saved = Self {
+            client_min_messages,
+            log_min_messages,
+        };
+        // SAFETY: as for the read above; a plain `int` write.
+        unsafe { pg_sys::client_min_messages = client_min_messages.max(Self::LEVEL) };
+        // SAFETY: called in a backend (see "Soundness").
+        unsafe { Self::set_log_min_messages(log_min_messages.max(Self::LEVEL)) };
+        saved
     }
 
+    /// # Safety
+    ///
+    /// Must be called in a Postgres backend, see [`crate::compat::log_min_messages_slot`].
     unsafe fn log_min_messages_slot() -> Option<*mut c_int> {
-        // SAFETY: forwarded; only called in a backend.
+        // SAFETY: our own contract is the callee's: a Postgres backend.
         unsafe { crate::compat::log_min_messages_slot() }
     }
 
+    /// # Safety
+    ///
+    /// Same as [`Self::log_min_messages_slot`].
     unsafe fn log_min_messages() -> c_int {
-        // SAFETY: the slot points into Postgres' GUC variable.
-        unsafe { Self::log_min_messages_slot().map_or(Self::LEVEL, |slot| *slot) }
+        // SAFETY: the caller guarantees a Postgres backend, as the callee requires.
+        let slot = unsafe { Self::log_min_messages_slot() };
+        // SAFETY: the slot points to a live, aligned `int` of Postgres' GUC
+        // storage (inside the array on PG19); plain read, no reference.
+        slot.map_or(Self::LEVEL, |slot| unsafe { slot.read() })
     }
 
+    /// # Safety
+    ///
+    /// Same as [`Self::log_min_messages_slot`].
     unsafe fn set_log_min_messages(level: c_int) {
-        // SAFETY: as above; we only write values read from the same slot or
-        // `ERROR`.
+        // SAFETY: the caller guarantees a Postgres backend, as the callee requires.
         if let Some(slot) = unsafe { Self::log_min_messages_slot() } {
-            unsafe { *slot = level };
+            // SAFETY: as in `log_min_messages`; we only write values read from
+            // the same slot or `ERROR`, both valid log levels.
+            unsafe { slot.write(level) };
         }
     }
 }
 
 impl Drop for MessageSuppression {
     fn drop(&mut self) {
-        // SAFETY: restores the values captured in `new`.
-        unsafe {
-            pg_sys::client_min_messages = self.client_min_messages;
-            Self::set_log_min_messages(self.log_min_messages);
-        }
+        // SAFETY: restores the value captured in `new`; same variable, thread.
+        unsafe { pg_sys::client_min_messages = self.client_min_messages };
+        // SAFETY: as in `new`; `Drop` runs in the same backend.
+        unsafe { Self::set_log_min_messages(self.log_min_messages) };
     }
 }
 
@@ -272,9 +322,14 @@ impl Drop for MessageSuppression {
 fn lex(sql: &CStr) -> Option<Vec<Token>> {
     let _quiet = MessageSuppression::new();
     let mut context = PgMemoryContexts::new("pg_otel sanitize");
-    // SAFETY: the context is owned by this function and outlives the closure;
-    // nothing allocated inside is used after it returns (tokens are plain Rust
-    // data).
+    // SAFETY: `switch_to` requires that nothing allocated in the context is
+    // used after it ends. The context is owned by this function and outlives the
+    // closure; the result is plain Rust data (`Vec<Token>` of offsets), nothing
+    // from the context escapes. `scan_tokens` may `ereport`: `PgTryBuilder`
+    // catches the `longjmp`/unwind, so `switch_to` restores
+    // `CurrentMemoryContext` normally and the context is then dropped, freeing
+    // the scanner buffers whether the scan succeeded or not.
+    // <https://www.postgresql.org/docs/18/xfunc-c.html>
     unsafe {
         context.switch_to(|_| {
             PgTryBuilder::new(|| scan_tokens(sql))
@@ -294,39 +349,55 @@ fn scan_tokens(sql: &CStr) -> Option<Vec<Token>> {
     let mut tokens = Vec::new();
     let mut valid = true;
 
-    // SAFETY: `sql` is NUL-terminated; `extra` outlives the scanner and is
-    // only used through it. The keyword tables are Postgres' own static tables, as
-    // required by `scanner_init`.
+    // SAFETY: `sql` is NUL-terminated and, since the scanner copies it into
+    // its own `scanbuf` (palloc'd in the current context), only needs to be
+    // valid for this call. `extra` is a valid, exclusive, zero-initialised
+    // `core_yy_extra_type` that outlives the scanner and is only used through
+    // it. `ScanKeywords` and `ScanKeywordTokens` are Postgres' static keyword
+    // tables, as `scanner_init` requires. May `ereport` (inside `PgTryBuilder`).
+    // <https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/scan.l>
     let scanner = unsafe {
         pg_sys::scanner_init(
             sql.as_ptr(),
-            &mut extra,
+            &raw mut extra,
             &raw const pg_sys::ScanKeywords,
             pg_sys::ScanKeywordTokens.as_ptr(),
         )
     };
     loop {
-        // SAFETY: `scanner` was returned by `scanner_init` and is not finished.
-        let code = unsafe { pg_sys::core_yylex(&mut yylval, &mut yylloc, scanner) };
+        // SAFETY: `scanner` was returned by `scanner_init` and is not finished;
+        // `yylval`/`yylloc` are valid, aligned and exclusive for the call.
+        let code = unsafe { pg_sys::core_yylex(&raw mut yylval, &raw mut yylloc, scanner) };
         if code == END_OF_INPUT {
             break;
         }
-        // SAFETY: only read for PARAM tokens, where the scanner set `ival`.
+        // SAFETY: `yylval` is a union. `ival` is read only for `PARAM`, where
+        // `scan.l` sets `yylval->ival` (`from_code` calls the closure for no other
+        // token), and reading a `c_int` from the initialised union is valid.
         let kind = TokenKind::from_code(code, || unsafe { yylval.ival });
         let Ok(start) = usize::try_from(yylloc) else {
             valid = false;
             break;
         };
-        // SAFETY: flex terminated the current token with a NUL inside
-        // `scanbuf`, which is itself NUL-terminated, so this stays in bounds.
-        let len = unsafe { CStr::from_ptr(extra.scanbuf.add(start)) }.count_bytes();
+        // SAFETY: `yylloc` is `yytext - scanbuf` for the current token
+        // (`SET_YYLOC` in `scan.l`), so `scanbuf + start` lies inside the
+        // allocation of `scanbuflen + 2` bytes, which `scanbuf` has provenance
+        // for.
+        let token_start = unsafe { extra.scanbuf.add(start) };
+        // SAFETY: flex NUL-terminates the current token in place and the buffer
+        // ends with NULs, so `CStr::from_ptr` stops inside the allocation. The
+        // `&CStr` is dropped immediately (only its length is kept), before the
+        // next `core_yylex` mutates the buffer.
+        let len = unsafe { CStr::from_ptr(token_start) }.count_bytes();
         tokens.push(Token {
             kind,
             start,
             end: start + len,
         });
     }
-    // SAFETY: matches the `scanner_init` above.
+    // SAFETY: matches the `scanner_init` above and is called once; the scanner
+    // is not used afterwards (`extra` is dropped last, and holds no Rust
+    // ownership of the palloc'd buffers).
     unsafe { pg_sys::scanner_finish(scanner) };
     valid.then_some(tokens)
 }
@@ -537,7 +608,8 @@ pub unsafe fn sanitize(
     normalize_text: bool,
     max_len: usize,
 ) -> Option<String> {
-    // SAFETY: forwarded contract.
+    // SAFETY: same contract as `current_statement` (`source_text` is null or a valid
+    // NUL-terminated string for the call).
     let statement = unsafe { current_statement(source_text, stmt_location, stmt_len) }?;
     let text = if normalize_text {
         normalize(&statement)?
@@ -863,14 +935,12 @@ mod tests {
         let source = CString::new(text).expect("no NUL in test input");
         let start = text.find("SELECT 'topsecret'").expect("present") as i32;
         let len = text.find("; SELECT 3").expect("present") as i32 - start;
-        // SAFETY: `source` is a valid NUL-terminated string.
-        let (normalized, raw, short) = unsafe {
-            (
-                sanitize(source.as_ptr(), start, len, true, 1024),
-                sanitize(source.as_ptr(), start, len, false, 1024),
-                sanitize(source.as_ptr(), start, len, true, 8),
-            )
-        };
+        // SAFETY: `source` is a valid NUL-terminated string for all three calls.
+        let normalized = unsafe { sanitize(source.as_ptr(), start, len, true, 1024) };
+        // SAFETY: `source` is a valid NUL-terminated string kept alive by this test.
+        let raw = unsafe { sanitize(source.as_ptr(), start, len, false, 1024) };
+        // SAFETY: `source` is a valid NUL-terminated string kept alive by this test.
+        let short = unsafe { sanitize(source.as_ptr(), start, len, true, 8) };
         assert_eq!(
             normalized.as_deref(),
             Some("SELECT $1, ...(1 more columns) FROM t")
@@ -927,17 +997,56 @@ mod tests {
     }
 
     #[pg_test]
+    fn token_kinds_match_the_scanner() {
+        let sql = CString::new("SELECT 1, 1.5, 'a', B'1', X'1', $7, x").expect("no NUL");
+        let kinds: Vec<_> = lex(&sql)
+            .expect("scans")
+            .iter()
+            .map(|token| token.kind)
+            .collect();
+        use TokenKind::{Constant, Other, Param};
+        // SELECT 1 , 1.5 , 'a' , B'1' , X'1' , $7 , x
+        assert_eq!(
+            kinds,
+            [
+                Other,
+                Constant,
+                Other,
+                Constant,
+                Other,
+                Constant,
+                Other,
+                Constant,
+                Other,
+                Constant,
+                Other,
+                Param(7),
+                Other,
+                Other
+            ]
+        );
+    }
+
+    #[pg_test]
     fn message_levels_are_restored_after_scanning() {
+        // SAFETY: pg_tests run in a backend on one thread; plain read of a
+        // backend-local GUC variable.
         let client = unsafe { pg_sys::client_min_messages };
+        // SAFETY: as for the first read in this test (backend, one thread).
         let log_level = unsafe { MessageSuppression::log_min_messages() };
         let _ = normalize("SELECT 1");
         let _ = normalize("SELECT 'unterminated");
+        // SAFETY: as for the first read in this test (backend, one thread).
         assert_eq!(unsafe { pg_sys::client_min_messages }, client);
+        // SAFETY: as for the first read in this test (backend, one thread).
         assert_eq!(unsafe { MessageSuppression::log_min_messages() }, log_level);
         {
             let _quiet = MessageSuppression::new();
-            assert!(unsafe { pg_sys::client_min_messages } >= pgrx::PgLogLevel::ERROR as c_int);
+            // SAFETY: as for the first read in this test (backend, one thread).
+            let during = unsafe { pg_sys::client_min_messages };
+            assert!(during >= pgrx::PgLogLevel::ERROR as c_int);
         }
+        // SAFETY: as for the first read in this test (backend, one thread).
         assert_eq!(unsafe { pg_sys::client_min_messages }, client);
     }
 
