@@ -406,7 +406,6 @@ mod tests {
         let mut findings: Vec<Finding> = Vec::new();
         let (mut total, mut compared, mut generator_errors, mut generator_timeouts) =
             (0u64, 0u64, 0u64, 0u64);
-        let mut allowed: BTreeMap<String, u64> = BTreeMap::new();
         let mut coverage: BTreeMap<String, u64> = BTreeMap::new();
         let mut timings = Timings::default();
         let mut error_samples: HashMap<String, (u64, String)> = HashMap::new();
@@ -456,9 +455,6 @@ mod tests {
                     }
                     for key in comparison.coverage {
                         *coverage.entry(key).or_default() += 1;
-                    }
-                    for mismatch in comparison.allowed {
-                        *allowed.entry(mismatch.signature()).or_default() += 1;
                     }
                     let mut by_signature: BTreeMap<String, Vec<String>> = BTreeMap::new();
                     for mismatch in comparison.mismatches {
@@ -530,7 +526,6 @@ mod tests {
                 secs(*time)
             );
         }
-        report += &format!("FUZZ allowed {allowed:?}\n");
         report += &format!("FUZZ coverage {coverage:?}\n");
         for (message, (index, query)) in &error_samples {
             report += &format!("FUZZ generator_error index={index} {message} query={query}\n");

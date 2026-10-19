@@ -32,17 +32,8 @@ impl Mismatch {
 #[derive(Debug, Default)]
 pub struct Comparison {
     pub mismatches: Vec<Mismatch>,
-    /// Known differences that were ignored (see [`is_allowed`]).
-    pub allowed: Vec<Mismatch>,
     /// What the plan contained: `node:<EXPLAIN node type>` and `feature:<...>`.
     pub coverage: Vec<String>,
-}
-
-/// Known pg_otel bugs that are tracked elsewhere and must not fail the fuzzer.
-fn is_allowed(mismatch: &Mismatch) -> bool {
-    // Tracked as "ModifyTable plan node spans have no postgresql.plan.relation": ModifyTable spans have no
-    // `postgresql.plan.relation`.
-    mismatch.kind == "relation" && mismatch.node == "ModifyTable"
 }
 
 fn attr<'a>(span: &'a SpanData, key: &str) -> Option<&'a Value> {
@@ -87,16 +78,11 @@ struct Walker<'a> {
 
 impl Walker<'_> {
     fn report(&mut self, kind: &'static str, node: &str, path: &str, detail: String) {
-        let mismatch = Mismatch {
+        self.out.mismatches.push(Mismatch {
             kind,
             node: node.to_owned(),
             detail: format!("{path}: {detail}"),
-        };
-        if is_allowed(&mismatch) {
-            self.out.allowed.push(mismatch);
-        } else {
-            self.out.mismatches.push(mismatch);
-        }
+        });
     }
 
     fn node(&mut self, plan: &Json, span: &SpanData, path: &str) {
