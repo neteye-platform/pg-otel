@@ -158,7 +158,11 @@ impl Generator {
         let and_ = if filter.is_empty() { " WHERE" } else { " AND" };
         let mut cols = Vec::new();
         for i in 0..n {
-            cols.push(format!("{}.{}", aliases[i], self.pick(&TABLES[tables[i]].1)));
+            cols.push(format!(
+                "{}.{}",
+                aliases[i],
+                self.pick(&TABLES[tables[i]].1)
+            ));
         }
         let first = &cols[0];
         let last = &cols[n - 1];
@@ -170,56 +174,134 @@ impl Generator {
             0 | 1 => format!("SELECT {all} FROM {from}{where_}"),
             2 | 3 => {
                 let having = *self.pick(&["", "HAVING count(*) > 1"]);
-                format!("SELECT {first}, count(*), sum({last}) FROM {from}{where_} GROUP BY 1 {having} ORDER BY 1")
+                format!(
+                    "SELECT {first}, count(*), sum({last}) FROM {from}{where_} GROUP BY 1 {having} ORDER BY 1"
+                )
             }
             4 => format!("SELECT {first}, count(*) FROM {from}{where_} GROUP BY 1 ORDER BY 1"),
             // `IN (SELECT ...)`: semi join or hashed SubPlan.
-            5 => format!("SELECT {first} FROM {from}{where_}{and_} {first} IN (SELECT id FROM b WHERE g < {m})"),
+            5 => format!(
+                "SELECT {first} FROM {from}{where_}{and_} {first} IN (SELECT id FROM b WHERE g < {m})"
+            ),
             // Correlated scalar sub-select: SubPlan.
-            6 | 7 => format!("SELECT {first}, (SELECT max(v) FROM c WHERE c.b_id = {t0}.id) FROM {from}{where_}"),
+            6 | 7 => format!(
+                "SELECT {first}, (SELECT max(v) FROM c WHERE c.b_id = {t0}.id) FROM {from}{where_}"
+            ),
             // Uncorrelated: InitPlan.
             8 => format!("SELECT {all} FROM {from}{where_}{and_} {first} > (SELECT avg(v) FROM c)"),
-            9 => format!("SELECT {first} FROM {from}{where_}{and_} EXISTS (SELECT 1 FROM c WHERE c.b_id = {t0}.id AND c.v < {m})"),
-            10 => format!("SELECT {first} FROM {from}{where_}{and_} NOT EXISTS (SELECT 1 FROM c WHERE c.b_id = {t0}.id)"),
-            11 => format!("WITH x AS (SELECT {first} AS v FROM {from}{where_}) SELECT * FROM x x1 JOIN x x2 ON x1.v = x2.v"),
-            12 => format!("WITH x AS MATERIALIZED (SELECT {first} AS v FROM {from}{where_}) SELECT count(*) FROM x WHERE v < {}", self.0.u32(1..=3000)),
+            9 => format!(
+                "SELECT {first} FROM {from}{where_}{and_} EXISTS (SELECT 1 FROM c WHERE c.b_id = {t0}.id AND c.v < {m})"
+            ),
+            10 => format!(
+                "SELECT {first} FROM {from}{where_}{and_} NOT EXISTS (SELECT 1 FROM c WHERE c.b_id = {t0}.id)"
+            ),
+            11 => format!(
+                "WITH x AS (SELECT {first} AS v FROM {from}{where_}) SELECT * FROM x x1 JOIN x x2 ON x1.v = x2.v"
+            ),
+            12 => format!(
+                "WITH x AS MATERIALIZED (SELECT {first} AS v FROM {from}{where_}) SELECT count(*) FROM x WHERE v < {}",
+                self.0.u32(1..=3000)
+            ),
             13 | 14 => {
                 let all_ = *self.pick(&["", "ALL"]);
-                format!("SELECT {first} FROM {from}{where_} UNION {all_} SELECT id FROM c WHERE v < {}", self.0.u32(1..=99))
+                format!(
+                    "SELECT {first} FROM {from}{where_} UNION {all_} SELECT id FROM c WHERE v < {}",
+                    self.0.u32(1..=99)
+                )
             }
             15 => {
                 let op = *self.pick(&["INTERSECT", "EXCEPT", "INTERSECT ALL", "EXCEPT ALL"]);
-                format!("SELECT {first} FROM {from}{where_} {op} SELECT id FROM c WHERE v < {}", self.0.u32(1..=99))
+                format!(
+                    "SELECT {first} FROM {from}{where_} {op} SELECT id FROM c WHERE v < {}",
+                    self.0.u32(1..=99)
+                )
             }
-            16 => format!("SELECT {first}, row_number() OVER (PARTITION BY {last} ORDER BY {first}) FROM {from}{where_}"),
-            17 => format!("SELECT {first}, sum({last}) OVER (ORDER BY {first} ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM {from}{where_}"),
+            16 => format!(
+                "SELECT {first}, row_number() OVER (PARTITION BY {last} ORDER BY {first}) FROM {from}{where_}"
+            ),
+            17 => format!(
+                "SELECT {first}, sum({last}) OVER (ORDER BY {first} ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM {from}{where_}"
+            ),
             18 | 19 => {
                 let limit = *self.pick(&[0, 1, 5, 100]);
                 format!("SELECT {all} FROM {from}{where_} ORDER BY 1 LIMIT {limit}")
             }
             20 => format!("SELECT DISTINCT {first} FROM {from}{where_}"),
             // Incremental sort needs a presorted prefix.
-            21 => format!("SELECT {t0}.* FROM {from}{where_} ORDER BY {t0}.{}, {t0}.id DESC LIMIT {}", TABLES[tables[0]].1[1], self.0.u32(1..=500)),
-            22 => format!("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < {}) SELECT r.n, {first} FROM r JOIN {from} ON r.n = {first}{and_} true", self.0.u32(1..=200)),
-            23 => format!("SELECT * FROM (VALUES (1, 'x'), ({m}, 'y'), (3, 'z')) AS v(i, s) JOIN a ON a.id = v.i"),
-            24 => format!("SELECT s.g, {first} FROM generate_series(1, {}) s(g) JOIN {from} ON {first} = s.g{and_} true", self.0.u32(1..=500)),
-            25 => format!("SELECT generate_series(1, {t0}.id % {}) FROM {from}{where_}", self.0.u32(2..=5)),
-            26 => format!("SELECT * FROM {} {t0} WHERE {} FOR UPDATE", TABLES[tables[0]].0, self.predicate(t0, tables[0])),
+            21 => format!(
+                "SELECT {t0}.* FROM {from}{where_} ORDER BY {t0}.{}, {t0}.id DESC LIMIT {}",
+                TABLES[tables[0]].1[1],
+                self.0.u32(1..=500)
+            ),
+            22 => format!(
+                "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < {}) SELECT r.n, {first} FROM r JOIN {from} ON r.n = {first}{and_} true",
+                self.0.u32(1..=200)
+            ),
+            23 => format!(
+                "SELECT * FROM (VALUES (1, 'x'), ({m}, 'y'), (3, 'z')) AS v(i, s) JOIN a ON a.id = v.i"
+            ),
+            24 => format!(
+                "SELECT s.g, {first} FROM generate_series(1, {}) s(g) JOIN {from} ON {first} = s.g{and_} true",
+                self.0.u32(1..=500)
+            ),
+            25 => format!(
+                "SELECT generate_series(1, {t0}.id % {}) FROM {from}{where_}",
+                self.0.u32(2..=5)
+            ),
+            26 => format!(
+                "SELECT * FROM {} {t0} WHERE {} FOR UPDATE",
+                TABLES[tables[0]].0,
+                self.predicate(t0, tables[0])
+            ),
             27 => format!("SELECT * FROM a WHERE ctid = '(0,{})'", self.0.u32(1..=20)),
-            28 => format!("SELECT * FROM {} WHERE ctid >= '(0,1)' AND ctid < '({},0)'", *self.pick(&["a", "b", "c"]), self.0.u32(1..=8)),
-            29 => format!("SELECT * FROM a TABLESAMPLE {} ({}) REPEATABLE ({})", self.pick(&["SYSTEM", "BERNOULLI"]), self.0.u32(1..=60), self.0.u32(0..=99)),
-            30 => format!("SELECT {}", self.pick(&["1", "now() > now()", "(SELECT 1)"])),
+            28 => format!(
+                "SELECT * FROM {} WHERE ctid >= '(0,1)' AND ctid < '({},0)'",
+                *self.pick(&["a", "b", "c"]),
+                self.0.u32(1..=8)
+            ),
+            29 => format!(
+                "SELECT * FROM a TABLESAMPLE {} ({}) REPEATABLE ({})",
+                self.pick(&["SYSTEM", "BERNOULLI"]),
+                self.0.u32(1..=60),
+                self.0.u32(0..=99)
+            ),
+            30 => format!(
+                "SELECT {}",
+                self.pick(&["1", "now() > now()", "(SELECT 1)"])
+            ),
             31 => format!("SELECT * FROM a WHERE {} AND false", self.predicate("a", 0)),
             // Initial partition pruning (the bound is only known at executor start).
-            32 | 33 => format!("SELECT {} FROM p WHERE id {} (SELECT {})", *self.pick(&["count(*)", "id", "g"]), *self.pick(&["<", ">", "="]), self.0.u32(0..=3000)),
+            32 | 33 => format!(
+                "SELECT {} FROM p WHERE id {} (SELECT {})",
+                *self.pick(&["count(*)", "id", "g"]),
+                *self.pick(&["<", ">", "="]),
+                self.0.u32(0..=3000)
+            ),
             34 => format!("SELECT * FROM p ORDER BY id LIMIT {}", self.0.u32(1..=2000)),
-            35 => format!("SELECT * FROM p WHERE g = {} ORDER BY id", self.0.u32(0..=4)),
-            36 => format!("SELECT {t0}.id, x.m FROM {from}, LATERAL (SELECT max(c.v) AS m FROM c WHERE c.b_id = {t0}.id) x{where_}"),
+            35 => format!(
+                "SELECT * FROM p WHERE g = {} ORDER BY id",
+                self.0.u32(0..=4)
+            ),
+            36 => format!(
+                "SELECT {t0}.id, x.m FROM {from}, LATERAL (SELECT max(c.v) AS m FROM c WHERE c.b_id = {t0}.id) x{where_}"
+            ),
             // OR of indexed columns: BitmapOr.
-            37 => format!("SELECT * FROM a WHERE (k = {} OR g = {}) AND id < {}", self.0.u32(0..=99), self.0.u32(0..=6), self.0.u32(1..=3000)),
-            38 => format!("SELECT * FROM a WHERE k = {} AND g = {}", self.0.u32(0..=99), self.0.u32(0..=6)),
+            37 => format!(
+                "SELECT * FROM a WHERE (k = {} OR g = {}) AND id < {}",
+                self.0.u32(0..=99),
+                self.0.u32(0..=6),
+                self.0.u32(1..=3000)
+            ),
+            38 => format!(
+                "SELECT * FROM a WHERE k = {} AND g = {}",
+                self.0.u32(0..=99),
+                self.0.u32(0..=6)
+            ),
             // Parameterised inner side with few distinct keys: Memoize.
-            _ => format!("SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.k WHERE a.id < {}", self.0.u32(1..=3000)),
+            _ => format!(
+                "SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.k WHERE a.id < {}",
+                self.0.u32(1..=3000)
+            ),
         }
     }
 
@@ -231,11 +313,22 @@ impl Generator {
             1 => format!("UPDATE c SET v = v + 1 WHERE b_id < {b}"),
             2 => format!("DELETE FROM c WHERE v < {v}"),
             3 => "INSERT INTO c VALUES (1, 1, 1) RETURNING *".to_owned(),
-            4 => format!("UPDATE p SET id = id + 1 WHERE id < {}", self.0.u32(1..=2999)),
+            4 => format!(
+                "UPDATE p SET id = id + 1 WHERE id < {}",
+                self.0.u32(1..=2999)
+            ),
             5 => format!("DELETE FROM p WHERE g = {}", self.0.u32(0..=4)),
-            6 => format!("UPDATE a SET k = k + 1 FROM b WHERE b.a_id = a.id AND b.g = {}", self.0.u32(0..=12)),
-            7 => format!("MERGE INTO c USING b ON c.id = b.id WHEN MATCHED AND c.v < {v} THEN UPDATE SET v = c.v + 1 WHEN NOT MATCHED AND b.g = 1 THEN INSERT VALUES (b.id, b.g, b.a_id)"),
-            _ => format!("INSERT INTO p SELECT id, g FROM p WHERE id < {}", self.0.u32(1..=3000)),
+            6 => format!(
+                "UPDATE a SET k = k + 1 FROM b WHERE b.a_id = a.id AND b.g = {}",
+                self.0.u32(0..=12)
+            ),
+            7 => format!(
+                "MERGE INTO c USING b ON c.id = b.id WHEN MATCHED AND c.v < {v} THEN UPDATE SET v = c.v + 1 WHEN NOT MATCHED AND b.g = 1 THEN INSERT VALUES (b.id, b.g, b.a_id)"
+            ),
+            _ => format!(
+                "INSERT INTO p SELECT id, g FROM p WHERE id < {}",
+                self.0.u32(1..=3000)
+            ),
         }
     }
 }

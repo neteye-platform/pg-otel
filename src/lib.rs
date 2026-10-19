@@ -12,10 +12,10 @@ use crate::{
 };
 
 mod codec;
-#[cfg(any(test, feature = "pg_test"))]
-mod fuzz;
 mod compat;
 mod config;
+#[cfg(any(test, feature = "pg_test"))]
+mod fuzz;
 mod planning;
 mod postgres;
 mod queue;

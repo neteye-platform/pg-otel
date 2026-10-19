@@ -29,7 +29,10 @@ use std::{
 };
 
 use opentelemetry_sdk::trace::SpanData;
-use pgrx::{pg_sys, prelude::*};
+use pgrx::{
+    pg_sys::{self, panic::CaughtError},
+    prelude::*,
+};
 
 use crate::postgres::capture;
 use compare::compare;
@@ -93,7 +96,9 @@ fn log_report(report: &str) {
 fn rolled_back<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     // SAFETY: the pattern PL/pgSQL and pgrx-bench use for a block with an
     // exception handler: remember the contexts, run, and restore them before
-    // rolling the subtransaction back.
+    // rolling the subtransaction back. Plain calls into the transaction
+    // machinery of this backend, which is inside a transaction.
+    #[allow(clippy::multiple_unsafe_ops_per_block)]
     unsafe {
         let memory_context = pg_sys::CurrentMemoryContext;
         let resource_owner = pg_sys::CurrentResourceOwner;
@@ -101,11 +106,11 @@ fn rolled_back<T>(f: impl FnOnce() -> T) -> Result<T, String> {
         let result = PgTryBuilder::new(AssertUnwindSafe(|| Ok(f())))
             .catch_others(|error| {
                 Err(match error {
-                    pgrx::pg_sys::panic::CaughtError::PostgresError(report)
-                    | pgrx::pg_sys::panic::CaughtError::ErrorReport(report)
-                    | pgrx::pg_sys::panic::CaughtError::RustPanic { ereport: report, .. } => {
-                        format!("{:?}: {}", report.sql_error_code(), report.message())
-                    }
+                    CaughtError::PostgresError(report)
+                    | CaughtError::ErrorReport(report)
+                    | CaughtError::RustPanic {
+                        ereport: report, ..
+                    } => format!("{:?}: {}", report.sql_error_code(), report.message()),
                 })
             })
             .execute();
@@ -129,16 +134,28 @@ enum Outcome {
     PluginOnly(String),
 }
 
-fn explain(case: &Case, tracing: bool, timeout_ms: u64) -> Result<(serde_json::Value, Vec<SpanData>), String> {
+fn explain(
+    case: &Case,
+    tracing: bool,
+    timeout_ms: u64,
+) -> Result<(serde_json::Value, Vec<SpanData>), String> {
     rolled_back(|| {
         for (name, value) in &case.settings {
             Spi::run(&format!("SET LOCAL {name} = '{value}'")).unwrap();
         }
         let min_duration = if tracing { 0 } else { -1 };
-        Spi::run(&format!("SET LOCAL pg_otel.min_duration_ms = {min_duration}")).unwrap();
+        Spi::run(&format!(
+            "SET LOCAL pg_otel.min_duration_ms = {min_duration}"
+        ))
+        .unwrap();
         capture::start();
         // SAFETY: plain call that arms a timer of this backend.
-        unsafe { enable_timeout_after(STATEMENT_TIMEOUT, i32::try_from(timeout_ms).unwrap_or(i32::MAX)) };
+        unsafe {
+            enable_timeout_after(
+                STATEMENT_TIMEOUT,
+                i32::try_from(timeout_ms).unwrap_or(i32::MAX),
+            )
+        };
         let result = PgTryBuilder::new(AssertUnwindSafe(|| {
             Spi::get_one::<pgrx::Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", case.query))
         }))
@@ -151,7 +168,10 @@ fn explain(case: &Case, tracing: bool, timeout_ms: u64) -> Result<(serde_json::V
         // SAFETY: as above.
         unsafe { disable_timeout(STATEMENT_TIMEOUT, false) };
         let spans = capture::finish();
-        let document = result.expect("EXPLAIN failed").expect("EXPLAIN returned no row").0;
+        let document = result
+            .expect("EXPLAIN failed")
+            .expect("EXPLAIN returned no row")
+            .0;
         (document, spans.into_iter().map(SpanData::from).collect())
     })
 }
@@ -160,7 +180,10 @@ fn run_case(case: &Case, timeout_ms: u64) -> Outcome {
     match explain(case, true, timeout_ms) {
         Ok((document, spans)) => Outcome::Compared(compare(&document, &spans)),
         Err(on_error) => match explain(case, false, timeout_ms) {
-            Err(off_error) if on_error.starts_with("ERRCODE_QUERY_CANCELED") && off_error.starts_with("ERRCODE_QUERY_CANCELED") => {
+            Err(off_error)
+                if on_error.starts_with("ERRCODE_QUERY_CANCELED")
+                    && off_error.starts_with("ERRCODE_QUERY_CANCELED") =>
+            {
                 Outcome::GeneratorTimeout
             }
             Err(off_error) => Outcome::GeneratorError(off_error),
@@ -205,13 +228,15 @@ mod tests {
 
         let started = Instant::now();
         let mut findings: Vec<Finding> = Vec::new();
-        let (mut total, mut compared, mut generator_errors, mut generator_timeouts) = (0u64, 0u64, 0u64, 0u64);
+        let (mut total, mut compared, mut generator_errors, mut generator_timeouts) =
+            (0u64, 0u64, 0u64, 0u64);
         let mut allowed: BTreeMap<String, u64> = BTreeMap::new();
         let mut coverage: BTreeMap<String, u64> = BTreeMap::new();
         let mut error_samples: HashMap<String, (u64, String)> = HashMap::new();
 
         for index in 0.. {
-            if cases.is_some_and(|n| index >= n) || deadline.is_some_and(|d| started.elapsed() >= d) {
+            if cases.is_some_and(|n| index >= n) || deadline.is_some_and(|d| started.elapsed() >= d)
+            {
                 break;
             }
             let seed = case_seed(master, index);
@@ -236,24 +261,33 @@ mod tests {
                     }
                     let mut by_signature: BTreeMap<String, Vec<String>> = BTreeMap::new();
                     for mismatch in comparison.mismatches {
-                        by_signature.entry(mismatch.signature()).or_default().push(mismatch.detail);
+                        by_signature
+                            .entry(mismatch.signature())
+                            .or_default()
+                            .push(mismatch.detail);
                     }
                     found.extend(by_signature);
                 }
                 Outcome::GeneratorError(message) => {
                     generator_errors += 1;
-                    error_samples.entry(message).or_insert((index, case.query.clone()));
+                    error_samples
+                        .entry(message)
+                        .or_insert((index, case.query.clone()));
                 }
                 Outcome::GeneratorTimeout => {
                     generator_timeouts += 1;
-                    error_samples.entry("timeout with the plugin on and off".to_owned()).or_insert((index, case.query.clone()));
+                    error_samples
+                        .entry("timeout with the plugin on and off".to_owned())
+                        .or_insert((index, case.query.clone()));
                 }
                 Outcome::PluginOnly(message) => {
                     found.push((format!("plugin_only_failure: {message}"), vec![message]));
                 }
             }
             for (signature, diff) in found {
-                log_line(&format!("MISMATCH index={index} case_seed={seed} signature={signature}"));
+                log_line(&format!(
+                    "MISMATCH index={index} case_seed={seed} signature={signature}"
+                ));
                 match findings.iter_mut().find(|f| f.signature == signature) {
                     Some(finding) => finding.count += 1,
                     None => findings.push(Finding {
@@ -284,14 +318,22 @@ mod tests {
         for finding in findings.iter().take(MAX_REPORTED) {
             report += &format!(
                 "FUZZ MISMATCH signature=\"{}\" count={} master_seed={master} index={} case_seed={} settings=[{}] query={}\n",
-                finding.signature, finding.count, finding.index, finding.case_seed, finding.settings, finding.query
+                finding.signature,
+                finding.count,
+                finding.index,
+                finding.case_seed,
+                finding.settings,
+                finding.query
             );
             for line in &finding.diff {
                 report += &format!("FUZZ   diff {line}\n");
             }
         }
         if findings.len() > MAX_REPORTED {
-            report += &format!("FUZZ ... and {} more classes\n", findings.len() - MAX_REPORTED);
+            report += &format!(
+                "FUZZ ... and {} more classes\n",
+                findings.len() - MAX_REPORTED
+            );
         }
         // Rolled-back DML leaves dead tuples that cannot be vacuumed inside this one
         // transaction, so the tables slowly bloat; report it to judge the drift.
@@ -304,7 +346,11 @@ mod tests {
         .unwrap_or_default();
         report += &format!("FUZZ table_sizes {sizes}\n");
         log_report(&report);
-        assert!(findings.is_empty(), "{} mismatch classes, see the FUZZ lines above", findings.len());
+        assert!(
+            findings.is_empty(),
+            "{} mismatch classes, see the FUZZ lines above",
+            findings.len()
+        );
     }
 
     /// Replaying a case seed must give the same case, and the first case of a
