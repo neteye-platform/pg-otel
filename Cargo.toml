@@ -15,12 +15,21 @@ pg_bench = ["dep:pgrx-bench"]
 
 [dependencies]
 opentelemetry = { version = "0.32.0", default-features = false, features = ["tracing"] }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "http-proto", "grpc-tonic", "tls-ring"] }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
 tonic = { version = "0.14.6", features = ["tls-ring"] }
 pgrx = "=0.19.1"
 tokio = { version = "1.52.3", features = ["rt", "time"] }
 fastrand = "2.4.1"
+
+[dependencies.opentelemetry-otlp]
+version = "0.32.0"
+default-features = false
+features = [
+    "trace", # We only support traces for now.
+    "http-proto", "zstd-http", "hyper-client", # http client
+    "grpc-tonic", "zstd-tonic", # grpc client
+    "tls-ring", "tls-roots", "tls-webpki-roots" # tls config
+]
 
 [dependencies.pgrx-bench]
 version = "=0.19.1"
