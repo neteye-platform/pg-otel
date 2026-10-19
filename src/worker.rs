@@ -35,6 +35,9 @@ const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// The number of dropped spans is logged at most this often.
 const DROPPED_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Failed exports are logged at most this often.
+const EXPORT_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Signals that were received but not yet acted upon.
 ///
 /// `BackgroundWorker::sigterm_received` and `sighup_received` *consume* the
@@ -72,6 +75,7 @@ pub fn background_worker_run() {
 
     let mut exporter = runtime.block_on(build_exporter());
     let mut dropped_report = DroppedSpansReport::new(Instant::now());
+    let mut export_failures = ExportFailures::default();
     let mut signals = PendingSignals::default();
 
     loop {
@@ -89,12 +93,18 @@ pub fn background_worker_run() {
             reload_exporter(&runtime, &mut exporter);
         }
 
-        runtime.block_on(export_pending(exporter.as_mut(), &mut signals));
+        runtime.block_on(export_pending(
+            exporter.as_mut(),
+            &mut signals,
+            &mut export_failures,
+        ));
+        export_failures.log_if_due(Instant::now());
         dropped_report.log_if_due(Instant::now(), shared::dropped_spans());
     }
 
     // Hand over what is still queued.
-    runtime.block_on(flush_and_shutdown(exporter));
+    runtime.block_on(flush_and_shutdown(exporter, &mut export_failures));
+    export_failures.log_pending();
 }
 
 /// Rebuilds the exporter from the current GUC values. The old exporter is only
@@ -136,12 +146,12 @@ async fn shutdown_exporter(exporter: &SpanExporter) {
 /// exporter that never awaits, or no exporter at all, would otherwise never
 /// give the timeout a chance to fire) and by `tokio::time::timeout` around a
 /// single export that hangs.
-async fn flush_and_shutdown(mut exporter: Option<SpanExporter>) {
+async fn flush_and_shutdown(mut exporter: Option<SpanExporter>, failures: &mut ExportFailures) {
     let deadline = Instant::now() + SHUTDOWN_FLUSH_TIMEOUT;
     let mut buffer = Vec::new();
     let flush = drain_queue(
         || take_chunk(&mut buffer),
-        async |spans| export_chunk(exporter.as_mut(), spans).await,
+        async |spans| export_chunk(exporter.as_mut(), spans, failures).await,
         || Instant::now() >= deadline,
     );
     match tokio::time::timeout(SHUTDOWN_FLUSH_TIMEOUT, flush).await {
@@ -188,6 +198,64 @@ impl DroppedSpansReport {
         Some(format!(
             "Dropped {newly_dropped} spans because the span queue was full ({total} since server start); consider raising pg_otel.queue_size_kb"
         ))
+    }
+}
+
+/// Collects failed exports so an unreachable collector produces one log line
+/// per [`EXPORT_FAILURE_LOG_INTERVAL`] instead of one per batch.
+#[derive(Default)]
+struct ExportFailures {
+    last_logged_at: Option<Instant>,
+    batches: u64,
+    spans: u64,
+    last_error: String,
+}
+
+impl ExportFailures {
+    fn record(&mut self, spans: usize, error: String) {
+        self.batches += 1;
+        self.spans += spans as u64;
+        self.last_error = error;
+    }
+
+    /// Logs and resets the counters if there are failures and the last report
+    /// is at least [`EXPORT_FAILURE_LOG_INTERVAL`] old. The first failure is
+    /// reported right away.
+    fn log_if_due(&mut self, now: Instant) {
+        if let Some(message) = self.report(now) {
+            log!("{message}");
+        }
+    }
+
+    /// Logs whatever is outstanding regardless of the interval.
+    fn log_pending(&mut self) {
+        if let Some(message) = self.take_message(Instant::now()) {
+            log!("{message}");
+        }
+    }
+
+    fn report(&mut self, now: Instant) -> Option<String> {
+        if self
+            .last_logged_at
+            .is_some_and(|at| now.duration_since(at) < EXPORT_FAILURE_LOG_INTERVAL)
+        {
+            return None;
+        }
+        self.take_message(now)
+    }
+
+    fn take_message(&mut self, now: Instant) -> Option<String> {
+        if self.batches == 0 {
+            return None;
+        }
+        self.last_logged_at = Some(now);
+        let message = format!(
+            "Could not export {} spans in {} batches since the last report; last error: {}",
+            self.spans, self.batches, self.last_error
+        );
+        self.batches = 0;
+        self.spans = 0;
+        Some(message)
     }
 }
 
@@ -325,11 +393,15 @@ async fn drain_queue<T>(
 /// Each chunk is copied out of the queue under the lock and decoded and
 /// exported after the lock is released. Without an exporter (misconfiguration)
 /// the queue is still drained so it cannot fill up and block newer spans.
-async fn export_pending(mut exporter: Option<&mut SpanExporter>, signals: &mut PendingSignals) {
+async fn export_pending(
+    mut exporter: Option<&mut SpanExporter>,
+    signals: &mut PendingSignals,
+    failures: &mut ExportFailures,
+) {
     let mut buffer = Vec::new();
     drain_queue(
         || take_chunk(&mut buffer),
-        async |spans| export_chunk(exporter.as_deref_mut(), spans).await,
+        async |spans| export_chunk(exporter.as_deref_mut(), spans, failures).await,
         || {
             signals.poll();
             signals.any()
@@ -338,9 +410,13 @@ async fn export_pending(mut exporter: Option<&mut SpanExporter>, signals: &mut P
     .await;
 }
 
-async fn export_chunk(exporter: Option<&mut SpanExporter>, spans: Vec<SpanData>) {
+async fn export_chunk(
+    exporter: Option<&mut SpanExporter>,
+    spans: Vec<SpanData>,
+    failures: &mut ExportFailures,
+) {
     match exporter {
-        Some(exporter) => export(exporter, spans).await,
+        Some(exporter) => export(exporter, spans, failures).await,
         None => debug1!(
             "Discarding {} spans: no OTLP exporter configured",
             spans.len()
@@ -348,11 +424,11 @@ async fn export_chunk(exporter: Option<&mut SpanExporter>, spans: Vec<SpanData>)
     }
 }
 
-async fn export(exporter: &mut SpanExporter, spans: Vec<SpanData>) {
+async fn export(exporter: &mut SpanExporter, spans: Vec<SpanData>, failures: &mut ExportFailures) {
     debug1!("Exporting {} spans", spans.len());
     let count = spans.len();
     if let Err(error) = exporter.export(spans).await {
-        log!("Could not export {count} spans: {error}");
+        failures.record(count, error.to_string());
     }
 }
 
@@ -464,6 +540,30 @@ mod tests {
                 sigterm: true
             }
             .any()
+        );
+    }
+
+    #[test]
+    fn export_failures_are_counted_and_rate_limited() {
+        let start = Instant::now();
+        let mut failures = ExportFailures::default();
+        assert_eq!(failures.report(start), None);
+        failures.record(3, "refused".into());
+        // The first failure is reported immediately.
+        let first = failures.report(start).unwrap();
+        assert!(first.contains("3 spans in 1 batches"), "{first}");
+        // Later failures are only counted until the interval has passed.
+        failures.record(2, "refused".into());
+        failures.record(4, "timeout".into());
+        assert_eq!(failures.report(start + Duration::from_secs(10)), None);
+        let second = failures
+            .report(start + EXPORT_FAILURE_LOG_INTERVAL)
+            .unwrap();
+        assert!(second.contains("6 spans in 2 batches"), "{second}");
+        assert!(second.contains("timeout"), "{second}");
+        assert_eq!(
+            failures.report(start + EXPORT_FAILURE_LOG_INTERVAL * 2),
+            None
         );
     }
 
