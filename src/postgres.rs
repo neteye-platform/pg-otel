@@ -601,6 +601,26 @@ pub unsafe fn plan_table_name(state: *const pg_sys::PlanState) -> Option<String>
             | pg_sys::NodeTag::T_ForeignScan
             | pg_sys::NodeTag::T_CustomScan
     );
+    if node_type == pg_sys::NodeTag::T_ModifyTable {
+        // EXPLAIN reports the nominal (parent) target relation, which for
+        // partitioned/inherited targets differs from the result relations.
+        // SAFETY: tag checked; `plan` is a `ModifyTable`.
+        let nominal = unsafe { (*plan.cast::<pg_sys::ModifyTable>()).nominalRelation };
+        // SAFETY: valid plan state (function contract); raw field read.
+        let estate = unsafe { (*state).state };
+        if nominal == 0 || estate.is_null() {
+            return None;
+        }
+        // SAFETY: `es_range_table` is a valid pointer list of RTEs.
+        let rtes = unsafe { list_pointers::<pg_sys::RangeTblEntry>((*estate).es_range_table) };
+        // `nominal` is a 1-based rtable index.
+        let rte = *rtes.get(usize::try_from(nominal).ok()?.checked_sub(1)?)?;
+        if rte.is_null() {
+            return None;
+        }
+        // SAFETY: non-null range table entry; syscache lookups per contract.
+        return unsafe { plan_table_identifier((*rte).relid) };
+    }
     if !is_scan {
         return None;
     }
