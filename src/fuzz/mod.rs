@@ -438,7 +438,9 @@ mod tests {
                 timings.failed_cases += case_time;
             }
             timings.slowest.push((case_time, index, case.query.clone()));
-            timings.slowest.sort_by(|a, b| b.0.cmp(&a.0));
+            timings
+                .slowest
+                .sort_by_key(|slow| std::cmp::Reverse(slow.0));
             timings.slowest.truncate(5);
             match outcome {
                 Outcome::Compared(comparison, was_flaky) => {
