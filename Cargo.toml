@@ -47,3 +47,13 @@ panic = "unwind"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+multiple_unsafe_ops_per_block = "warn"
+ref_as_ptr = "warn"
+borrow_as_ptr = "warn"

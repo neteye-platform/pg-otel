@@ -69,12 +69,21 @@ pub struct PlanKey {
 impl PlanKey {
     /// # Safety
     ///
-    /// `stmt` must be null or point to a valid `PlannedStmt`.
+    /// `stmt` must be null or point to a valid, initialised `PlannedStmt` whose
+    /// `planTree` is null or a valid `Plan`, and neither may be mutated while
+    /// this function runs (it does not outlive the call: the references below
+    /// are local).
     pub unsafe fn of(stmt: *const pg_sys::PlannedStmt) -> Option<Self> {
-        // SAFETY: null or valid per the function contract.
+        // SAFETY: null is handled by `?`. Otherwise, by the contract,
+        // the pointer is aligned and points to an initialised `PlannedStmt`
+        // (a palloc'd node), which stays allocated and unmodified for the
+        // duration of this call; the reference does not escape it, and only
+        // plain `Copy` fields are read from it.
+        // https://doc.rust-lang.org/std/ptr/index.html#pointer-to-reference-conversion
         let stmt = unsafe { stmt.as_ref()? };
-        // SAFETY: a planned statement's plan tree is null or valid. Utility
-        // statements have none and are never timed.
+        // SAFETY: the contract makes `planTree` null or a valid
+        // `Plan` node in the same palloc'd plan, alive as long as `stmt`; the same
+        // reasoning as for `stmt` applies. Utility statements have a null plan tree and are never timed.
         let plan = unsafe { stmt.planTree.as_ref()? };
         Some(Self {
             query_id: stmt.queryId,
@@ -182,13 +191,16 @@ pub fn timed(plan: impl FnOnce() -> *mut pg_sys::PlannedStmt) -> *mut pg_sys::Pl
     let started = Instant::now();
     let stmt = plan();
     let duration = started.elapsed();
-    // SAFETY: `stmt` was just returned by the planner.
+    // SAFETY: `stmt` was just returned by the planner: null, or a valid
+    // `PlannedStmt` in the current memory context, which nothing frees or
+    // mutates before `of` returns.
     if let Some(key) = unsafe { PlanKey::of(stmt) } {
         let timing = PlanningTiming {
             start,
             duration_ns: i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
         };
-        // SAFETY: plain read of a backend-local variable.
+        // SAFETY: only reads backend-local transaction state (`CurrentTransactionState`);
+        // we are in a backend inside a transaction, since we just planned.
         let subxact = unsafe { pg_sys::GetCurrentSubTransactionId() };
         PENDING.with_borrow_mut(|pending| pending.insert(key, subxact, timing));
     }
@@ -202,9 +214,16 @@ pub fn timed(plan: impl FnOnce() -> *mut pg_sys::PlannedStmt) -> *mut pg_sys::Pl
 ///
 /// `query_desc` must be null or point to a valid `QueryDesc`.
 pub unsafe fn take_for(query_desc: *const pg_sys::QueryDesc) -> Option<PlanningTiming> {
-    // SAFETY: null or valid per the function contract.
+    // SAFETY: null is handled by `?`. Otherwise valid per the
+    // contract: the `QueryDesc` is the executor's, allocated for the whole
+    // execution and not modified by this thread while we copy one pointer field
+    // out of it. The reference is a temporary that does not escape this
+    // expression (only the `plannedstmt` pointer value is kept).
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/executor/execdesc.h
     let stmt = unsafe { query_desc.as_ref()? }.plannedstmt;
-    // SAFETY: the executed statement is valid.
+    // SAFETY: `plannedstmt` of a live `QueryDesc` is the statement being
+    // executed: a valid `PlannedStmt` (or null) for the whole execution, which
+    // includes this call. Its `planTree` is valid for the same reason.
     let key = unsafe { PlanKey::of(stmt)? };
     PENDING.with_borrow_mut(|pending| pending.take(&key))
 }
@@ -225,6 +244,9 @@ fn ends_transaction(event: pg_sys::XactEvent::Type) -> bool {
     )
 }
 
+/// # Safety
+///
+/// Must only be called by Postgres as an `XactCallback`. Uses no pointer.
 unsafe extern "C-unwind" fn on_xact_event(event: pg_sys::XactEvent::Type, _arg: *mut c_void) {
     if ends_transaction(event) {
         // Cannot fail: the table is only borrowed for short, non-reentrant
@@ -233,6 +255,9 @@ unsafe extern "C-unwind" fn on_xact_event(event: pg_sys::XactEvent::Type, _arg: 
     }
 }
 
+/// # Safety
+///
+/// Must only be called by Postgres as a `SubXactCallback`. Uses no pointer.
 unsafe extern "C-unwind" fn on_subxact_event(
     event: pg_sys::SubXactEvent::Type,
     my_subid: pg_sys::SubTransactionId,
@@ -247,12 +272,13 @@ unsafe extern "C-unwind" fn on_subxact_event(
 /// Registers the transaction callbacks that keep the table clean. Call once from
 /// `_PG_init`.
 pub fn register_callbacks() {
-    // SAFETY: called once in the postmaster; the callbacks are plain functions
-    // and need no argument.
-    unsafe {
-        pg_sys::RegisterXactCallback(Some(on_xact_event), ptr::null_mut());
-        pg_sys::RegisterSubXactCallback(Some(on_subxact_event), ptr::null_mut());
-    }
+    // SAFETY: the callback is a plain function with the `XactCallback`
+    // signature; it ignores its argument, so null is fine. Registered once,
+    // from `_PG_init`: https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/transam/xact.c
+    unsafe { pg_sys::RegisterXactCallback(Some(on_xact_event), ptr::null_mut()) };
+    // SAFETY: the callback is a plain function with the `SubXactCallback`
+    // signature that ignores its argument, so null is fine.
+    unsafe { pg_sys::RegisterSubXactCallback(Some(on_subxact_event), ptr::null_mut()) };
 }
 
 #[cfg(test)]

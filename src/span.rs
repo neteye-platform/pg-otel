@@ -1,7 +1,4 @@
-use std::{
-    ptr,
-    time::{Duration, SystemTime},
-};
+use std::time::{Duration, SystemTime};
 
 use opentelemetry::{
     InstrumentationScope, KeyValue, SpanId, TraceFlags, TraceId,
@@ -375,7 +372,14 @@ impl SpanRecord {
     /// exists, and `plan_spans_omitted` is the number of plan nodes left out of
     /// the trace. Calls into Postgres to sanitize the query text, so it must not
     /// run while the span queue lock is held.
-    pub fn from_query(
+    ///
+    /// # Safety
+    ///
+    /// `query_desc` must be null or point to a valid `QueryDesc` during
+    /// `ExecutorEnd` (before `standard_ExecutorEnd`): its `plannedstmt` and
+    /// `sourceText` must be null or valid, and nothing may mutate it during
+    /// the call.
+    pub unsafe fn from_query(
         query_desc: *const QueryDesc,
         timeline: &Timeline,
         planning_time_ns: Option<i64>,
@@ -384,13 +388,17 @@ impl SpanRecord {
         span_id: SpanId,
         plan_spans_omitted: usize,
     ) -> Option<Self> {
+        // SAFETY: null or valid per the function contract. The reference is
+        // only read; the executor is idle in ExecutorEnd, so nothing mutates
+        // the QueryDesc, and it outlives this call (freed after the hook).
         let query_desc = unsafe { query_desc.as_ref()? };
-        // SAFETY: `query_desc` is valid in ExecutorEnd.
+        // SAFETY: `query_desc` is valid in ExecutorEnd (function contract).
         let total_ns = unsafe { compat::query_total_ns(query_desc)? };
 
         let operation = query_name(query_desc.operation);
         let (normalized_query, query_text, query_id) =
-            query_texts_and_id(query_desc, query_text_mode);
+            // SAFETY: valid QueryDesc in ExecutorEnd (function contract).
+            unsafe { query_texts_and_id(query_desc, query_text_mode) };
         // The root span name is always normalized, even when `query_text` is
         // raw or disabled, so span names cannot expose literal values.
         let name = normalized_query
@@ -427,31 +435,61 @@ impl SpanRecord {
     /// A node that never ran, or whose instrumentation is unusable, still gets
     /// a span (so the tree keeps its shape) with zero timings and a flag
     /// attribute saying why.
-    pub fn from_plan(
+    ///
+    /// # Safety
+    ///
+    /// `plan_node` must be null or point to a valid plan state of the executor
+    /// tree of a finished statement, i.e. during `ExecutorEnd` before
+    /// `standard_ExecutorEnd` frees the tree. It must be the header of the
+    /// concrete state struct its plan's `NodeTag` names (`AppendState` for
+    /// `T_Append`, ...), and that whole struct, the plan tree and the
+    /// node's instrumentation must not be accessed by anyone else during the
+    /// call.
+    pub unsafe fn from_plan(
         plan_node: *mut PlanState,
         wall_start: SystemTime,
         parent: &SpanLink,
         edge: Option<&ChildEdge>,
     ) -> Option<Self> {
-        let plan_node = unsafe { plan_node.as_ref() }?;
-        let plan = unsafe { plan_node.plan.as_ref() }?;
-        // SAFETY: the plan state is valid and not used by anyone else now.
-        let (timings, never_executed, incomplete) =
-            match unsafe { compat::node_instrument(plan_node) } {
-                NodeInstrument::Done(stats) => (stats, stats.loops == 0.0, false),
-                NodeInstrument::Incomplete => (NodeStats::default(), false, true),
-            };
+        // SAFETY: null or valid per the function contract. Only this
+        // `PlanState` header is borrowed (shared, read-only): the executor is
+        // idle, and the tree lives until `standard_ExecutorEnd`
+        // (https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/execMain.c).
+        // `node_instrument` mutates only the separately allocated
+        // `Instrumentation`, never the header. Concrete state types are
+        // reached through the raw `plan_node`, not through this reference.
+        let node = unsafe { plan_node.as_ref() }?;
+        let plan_ptr = node.plan;
+        // SAFETY: `plan` is null or points to the node's `Plan`, which the
+        // executor treats as read-only and which outlives the executor tree
+        // (https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/README).
+        let plan = unsafe { plan_ptr.as_ref() }?;
+        // SAFETY: `node` is valid and its instrumentation is not accessed by
+        // anyone else now (function contract).
+        let (timings, never_executed, incomplete) = match unsafe { compat::node_instrument(node) } {
+            NodeInstrument::Done(stats) => (stats, stats.loops == 0.0, false),
+            NodeInstrument::Incomplete => (NodeStats::default(), false, true),
+        };
         let end_time =
             (wall_start + Duration::from_nanos(timings.total_ns as u64)).min(parent.end_time);
 
-        let relation = plan_table_name(plan_node).map(|table| truncated(&table, NAME_MAX_LEN));
+        // SAFETY: valid plan state per the function contract; in a backend
+        // with a live transaction (ExecutorEnd), as the catalog lookups need.
+        let relation =
+            unsafe { plan_table_name(plan_node) }.map(|table| truncated(&table, NAME_MAX_LEN));
         let table_suffix = relation
             .as_deref()
             .map(|table| format!(" [{table}]"))
             .unwrap_or_default();
-        let node_type = format!("{:?}", plan_node.type_);
+        let node_type = format!("{:?}", node.type_);
         let subplan_name = edge.and_then(|edge| edge.subplan_name.clone());
         let name = plan_span_name(subplan_name.as_deref(), &node_type, &table_suffix);
+
+        // SAFETY: `plan_node` and `plan_ptr` are valid and share the node
+        // type named by the plan tag (function contract).
+        let subplans_removed = unsafe { pruned_member_count(plan_node, plan_ptr) };
+        // SAFETY: same contract as `pruned_member_count` (see its docs).
+        let workers_launched = unsafe { launched_workers(plan_node, plan_ptr) };
 
         Some(SpanRecord {
             trace_id: parent.trace_id,
@@ -465,8 +503,8 @@ impl SpanRecord {
                 relation,
                 parent_relationship: edge.map(|edge| edge.relationship.as_str().to_owned()),
                 subplan_name,
-                subplans_removed: unsafe { pruned_member_count(plan_node, plan) },
-                workers_launched: unsafe { launched_workers(plan_node, plan) },
+                subplans_removed,
+                workers_launched,
                 never_executed,
                 instrumentation_incomplete: incomplete,
                 startup_cost: plan.startup_cost,
@@ -502,21 +540,40 @@ fn plan_span_name(subplan_name: Option<&str>, node_type: &str, table_suffix: &st
 ///
 /// # Safety
 ///
-/// `plan_node` and `plan` must be a valid executor node and its plan.
-unsafe fn pruned_member_count(plan_node: &PlanState, plan: &pg_sys::Plan) -> u64 {
-    let (planned, live) = match plan.type_ {
-        // SAFETY: the plan tag says which concrete node types these are.
-        pg_sys::NodeTag::T_Append => unsafe {
-            let planned = list_length((*ptr::from_ref(plan).cast::<pg_sys::Append>()).appendplans);
-            let live = (*ptr::from_ref(plan_node).cast::<pg_sys::AppendState>()).as_nplans;
-            (planned, live)
-        },
-        pg_sys::NodeTag::T_MergeAppend => unsafe {
-            let planned =
-                list_length((*ptr::from_ref(plan).cast::<pg_sys::MergeAppend>()).mergeplans);
-            let live = (*ptr::from_ref(plan_node).cast::<pg_sys::MergeAppendState>()).ms_nplans;
-            (planned, live)
-        },
+/// `plan_node` must point to a valid executor node and `plan` to its `Plan`,
+/// and the node must be the header of the concrete state struct named by the
+/// plan's `NodeTag`. Both are only read through raw places, so no reference
+/// wider than the pointee type is created.
+unsafe fn pruned_member_count(plan_node: *const PlanState, plan: *const pg_sys::Plan) -> u64 {
+    // SAFETY: `plan` is valid; reads one `NodeTag`.
+    let tag = unsafe { (*plan).type_ };
+    // Every plan/state node embeds its parent struct as the first field
+    // (`Append.plan`, `AppendState.ps`), so the casts below are layout-valid:
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/nodes/plannodes.h
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/nodes/execnodes.h
+    // Fields are read through the raw pointers (no `&Append`/`&AppendState`),
+    // and the caller guarantees the whole concrete struct is allocated.
+    let (planned, live) = match tag {
+        pg_sys::NodeTag::T_Append => {
+            // SAFETY: tag is `T_Append`, so `plan` is an `Append`.
+            let planned_list = unsafe { (*plan.cast::<pg_sys::Append>()).appendplans };
+            // SAFETY: tag is `T_Append`, so `plan_node` is an `AppendState`.
+            // `as_nplans` is the member count left after startup pruning
+            // (nodeAppend.c, `ExecInitAppend`).
+            let live = unsafe { (*plan_node.cast::<pg_sys::AppendState>()).as_nplans };
+            // SAFETY: `planned_list` is a plan-tree list: NIL or valid, read-only.
+            (unsafe { list_length(planned_list) }, live)
+        }
+        pg_sys::NodeTag::T_MergeAppend => {
+            // SAFETY: tag is `T_MergeAppend`, so `plan` is a `MergeAppend`.
+            let planned_list = unsafe { (*plan.cast::<pg_sys::MergeAppend>()).mergeplans };
+            // SAFETY: tag is `T_MergeAppend`, so `plan_node` is a
+            // `MergeAppendState`; `ms_nplans` is the live member count
+            // (nodeMergeAppend.c, `ExecInitMergeAppend`).
+            let live = unsafe { (*plan_node.cast::<pg_sys::MergeAppendState>()).ms_nplans };
+            // SAFETY: `planned_list` is a plan-tree list: NIL or valid, read-only.
+            (unsafe { list_length(planned_list) }, live)
+        }
         _ => return 0,
     };
     u64::try_from(planned.saturating_sub(live)).unwrap_or(0)
@@ -527,22 +584,34 @@ unsafe fn pruned_member_count(plan_node: &PlanState, plan: &pg_sys::Plan) -> u64
 /// # Safety
 ///
 /// As for [`pruned_member_count`].
-unsafe fn launched_workers(plan_node: &PlanState, plan: &pg_sys::Plan) -> Option<i64> {
-    // SAFETY: the plan tag says which concrete node type this is.
-    match plan.type_ {
+unsafe fn launched_workers(plan_node: *const PlanState, plan: *const pg_sys::Plan) -> Option<i64> {
+    // SAFETY: `plan` is valid; reads one `NodeTag`.
+    let tag = unsafe { (*plan).type_ };
+    // `nworkers_launched` is a field of `GatherState` / `GatherMergeState`
+    // (https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/nodes/execnodes.h),
+    // read through the raw pointer without forming a reference.
+    match tag {
+        // SAFETY: tag is `T_Gather`, so `plan_node` is a `GatherState`.
         pg_sys::NodeTag::T_Gather => Some(i64::from(unsafe {
-            (*ptr::from_ref(plan_node).cast::<pg_sys::GatherState>()).nworkers_launched
+            (*plan_node.cast::<pg_sys::GatherState>()).nworkers_launched
         })),
+        // SAFETY: tag is `T_GatherMerge`, so `plan_node` is a `GatherMergeState`.
         pg_sys::NodeTag::T_GatherMerge => Some(i64::from(unsafe {
-            (*ptr::from_ref(plan_node).cast::<pg_sys::GatherMergeState>()).nworkers_launched
+            (*plan_node.cast::<pg_sys::GatherMergeState>()).nworkers_launched
         })),
         _ => None,
     }
 }
 
 /// Length of a Postgres `List` (`list_length` is a static inline function).
-fn list_length(list: *const pg_sys::List) -> i32 {
-    // SAFETY: a List pointer is null (empty) or points to a valid List.
+///
+/// # Safety
+///
+/// `list` must be null (NIL, empty) or point to a valid `List` that nothing
+/// mutates during the call.
+unsafe fn list_length(list: *const pg_sys::List) -> i32 {
+    // SAFETY: null or valid per the function contract; the shared reference
+    // is dropped right after copying `length`.
     unsafe { list.as_ref() }.map_or(0, |list| list.length)
 }
 
@@ -556,17 +625,27 @@ fn truncated(s: &str, max_bytes: usize) -> String {
 /// Normalization is always attempted for the root span name. The exported text
 /// still follows `mode`: it can be the same normalized value, raw text, or be
 /// absent entirely.
-fn query_texts_and_id(
+///
+/// # Safety
+///
+/// `query_desc.plannedstmt` must be null or valid, and `query_desc.sourceText`
+/// null or a NUL-terminated string, both for the duration of the call.
+unsafe fn query_texts_and_id(
     query_desc: &QueryDesc,
     mode: QueryTextMode,
 ) -> (Option<String>, Option<String>, i64) {
-    // SAFETY: `plannedstmt` is null or valid for the duration of the hook.
+    // SAFETY: null or valid per the function contract. The `PlannedStmt` is
+    // read-only for the executor (it may be shared via the plan cache) and
+    // the reference ends after the three field copies.
     let (stmt_location, stmt_len, query_id) = match unsafe { query_desc.plannedstmt.as_ref() } {
         Some(stmt) => (stmt.stmt_location, stmt.stmt_len, stmt.queryId),
         None => (-1, 0, 0),
     };
-    // SAFETY: `sourceText` is null or a NUL-terminated string that outlives
-    // the hook. `sanitize` truncates to `QUERY_TEXT_MAX_LEN`.
+    // SAFETY: `sourceText` is null or NUL-terminated and stays valid for the
+    // call (function contract; the portal keeps the string for the lifetime of
+    // the QueryDesc, see `CreateQueryDesc` in
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/pquery.c).
+    // `sanitize` truncates to `QUERY_TEXT_MAX_LEN`.
     let normalized = unsafe {
         sanitize::sanitize(
             query_desc.sourceText,
@@ -579,7 +658,8 @@ fn query_texts_and_id(
     let text = match mode {
         QueryTextMode::Off => None,
         QueryTextMode::Normalized => normalized.clone(),
-        // SAFETY: same source-text contract as above.
+        // SAFETY: `sourceText` is null or NUL-terminated and valid for the
+        // call (function contract), as for the normalized call.
         QueryTextMode::Raw => unsafe {
             sanitize::sanitize(
                 query_desc.sourceText,

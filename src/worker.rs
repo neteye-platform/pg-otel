@@ -103,6 +103,14 @@ pub fn background_worker_run() {
 fn reload_exporter(runtime: &Runtime, exporter: &mut Option<SpanExporter>) {
     // SIGHUP only sets the worker's flag. Reload this process's local GUC
     // values before taking the configuration snapshot.
+    // SAFETY: `ProcessConfigFile(PGC_SIGHUP)` is the documented reload step
+    // after SIGHUP, valid in any server process (the assertion in it allows
+    // PGC_SIGHUP everywhere, PGC_POSTMASTER only in the postmaster). We are in
+    // the worker's main thread, outside signal handlers (the handler only set
+    // a flag). The only context it needs is a valid `CurrentMemoryContext`: it
+    // creates a private "config file processing" child of it, switches to that,
+    // and deletes it before returning, so nothing leaks across SIGHUPs:
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/misc/guc-file.l
     unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
 
     let Some(new_exporter) = runtime.block_on(build_exporter()) else {
@@ -263,13 +271,22 @@ async fn build_exporter() -> Option<SpanExporter> {
 
 /// The running server's `server_version` (for example `19beta1`).
 fn server_version() -> String {
-    // SAFETY: `GetConfigOption` returns null or a NUL-terminated string owned by
-    // the GUC machinery; it is copied immediately. With `missing_ok` it never
-    // raises an error.
-    let version = unsafe {
-        let value = pg_sys::GetConfigOption(c"server_version".as_ptr(), true, false);
-        (!value.is_null()).then(|| CStr::from_ptr(value).to_string_lossy().into_owned())
-    };
+    // SAFETY: the name is a NUL-terminated literal. `server_version` is a
+    // built-in GUC, so `find_option` finds it; with `missing_ok` an unknown name
+    // would give null instead of an ERROR, and `restrict_privileged = false`
+    // skips the permission check (the only other ERROR). Valid in any backend
+    // or worker after GUC initialisation:
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/misc/guc.c
+    let value = unsafe { pg_sys::GetConfigOption(c"server_version".as_ptr(), true, false) };
+    let version = (!value.is_null()).then(|| {
+        // SAFETY: non-null, so a NUL-terminated string that is either static or
+        // in a static buffer owned by the GUC machinery. Nothing else runs
+        // between the call and this copy, so it is not overwritten before
+        // `to_owned` finishes.
+        unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned()
+    });
     version.unwrap_or_else(|| pg_sys::PG_VERSION.to_string_lossy().into_owned())
 }
 

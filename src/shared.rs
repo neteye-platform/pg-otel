@@ -21,7 +21,10 @@ use std::{
     cell::UnsafeCell,
     mem::size_of,
     ptr,
-    sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering},
+    },
 };
 
 use pgrx::{pg_guard, pg_sys};
@@ -61,8 +64,11 @@ static HEADER: AtomicPtr<Header> = AtomicPtr::new(ptr::null_mut());
 /// same address.
 static QUEUE_LOCK: AtomicPtr<pg_sys::LWLock> = AtomicPtr::new(ptr::null_mut());
 
-static mut PREV_SHMEM_REQUEST_HOOK: pg_sys::shmem_request_hook_type = None;
-static mut PREV_SHMEM_STARTUP_HOOK: pg_sys::shmem_startup_hook_type = None;
+/// Hooks that were installed before ours, to chain to. Each is set exactly once,
+/// by [`install_hooks`] in `_PG_init` (in the postmaster, before any other
+/// process exists), and only read afterwards.
+static PREV_SHMEM_REQUEST_HOOK: OnceLock<pg_sys::shmem_request_hook_type> = OnceLock::new();
+static PREV_SHMEM_STARTUP_HOOK: OnceLock<pg_sys::shmem_startup_hook_type> = OnceLock::new();
 
 /// Bytes of shared memory needed for a queue of `queue_size_kb` kilobytes.
 fn shared_memory_size(queue_size_kb: i32) -> usize {
@@ -72,53 +78,90 @@ fn shared_memory_size(queue_size_kb: i32) -> usize {
 /// Installs the shared memory hooks. Must be called from `_PG_init`, after the
 /// GUCs are defined, while `shared_preload_libraries` is being processed.
 pub fn install_hooks() {
-    // SAFETY: called once from _PG_init in the postmaster.
-    unsafe {
-        PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
-        pg_sys::shmem_request_hook = Some(on_shmem_request);
-        PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
-        pg_sys::shmem_startup_hook = Some(on_shmem_startup);
-    }
+    // SAFETY: `shmem_request_hook` is a plain global of the postmaster. It is
+    // only written during startup, from this single thread (`_PG_init`).
+    let prev_request = unsafe { pg_sys::shmem_request_hook };
+    // SAFETY: `shmem_startup_hook` is likewise a startup-only global, read on the same single thread.
+    let prev_startup = unsafe { pg_sys::shmem_startup_hook };
+    assert!(
+        PREV_SHMEM_REQUEST_HOOK.set(prev_request).is_ok()
+            && PREV_SHMEM_STARTUP_HOOK.set(prev_startup).is_ok(),
+        "shared memory hooks installed twice"
+    );
+    // SAFETY: same single-threaded startup context. Chaining to the previous
+    // hook is what the hook protocol asks for:
+    // https://www.postgresql.org/docs/current/xfunc-c.html#XFUNC-SHARED-ADDIN
+    unsafe { pg_sys::shmem_request_hook = Some(on_shmem_request) };
+    // SAFETY: still the single-threaded `_PG_init` context, so nothing reads the hook concurrently.
+    unsafe { pg_sys::shmem_startup_hook = Some(on_shmem_startup) };
 }
 
+/// # Safety
+///
+/// Must only be called by Postgres as `shmem_request_hook`, in the postmaster
+/// while `shared_preload_libraries` is processed.
 #[pg_guard]
 unsafe extern "C-unwind" fn on_shmem_request() {
-    // SAFETY: hooks are only changed in _PG_init, before they can run.
-    if let Some(prev) = unsafe { PREV_SHMEM_REQUEST_HOOK } {
+    // `PREV_*` is set before this hook can be called (see `install_hooks`).
+    if let Some(Some(prev)) = PREV_SHMEM_REQUEST_HOOK.get().copied() {
+        // SAFETY: the previous hook is called in the same context as ours.
         unsafe { prev() };
     }
-    // SAFETY: allowed inside the shmem request hook.
-    unsafe {
-        pg_sys::RequestAddinShmemSpace(shared_memory_size(get_queue_size_kb()));
-        pg_sys::RequestNamedLWLockTranche(LWLOCK_TRANCHE.as_ptr(), 1);
-    }
+    // SAFETY: allowed (and only valid) inside the shmem request hook:
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/storage/ipc/ipci.c
+    unsafe { pg_sys::RequestAddinShmemSpace(shared_memory_size(get_queue_size_kb())) };
+    // SAFETY: still inside the shmem request hook. The name is a static
+    // NUL-terminated string; Postgres copies it.
+    unsafe { pg_sys::RequestNamedLWLockTranche(LWLOCK_TRANCHE.as_ptr(), 1) };
 }
 
+/// # Safety
+///
+/// Must only be called by Postgres as `shmem_startup_hook`, in the postmaster
+/// (or in each backend with `EXEC_BACKEND`) after shared memory exists.
 #[pg_guard]
 unsafe extern "C-unwind" fn on_shmem_startup() {
-    // SAFETY: see `on_shmem_request`.
-    if let Some(prev) = unsafe { PREV_SHMEM_STARTUP_HOOK } {
+    // `PREV_*` is set before this hook can be called (see `install_hooks`).
+    if let Some(Some(prev)) = PREV_SHMEM_STARTUP_HOOK.get().copied() {
+        // SAFETY: the previous hook is called in the same context as ours.
         unsafe { prev() };
     }
-    // SAFETY: inside the shmem startup hook.
+    // SAFETY: we are inside the shmem startup hook.
     unsafe { init_shared_header() };
 }
 
 /// # Safety
 ///
-/// Must be called from the shmem startup hook.
+/// Must be called from the shmem startup hook, after `on_shmem_request` ran.
 unsafe fn init_shared_header() {
     let size = shared_memory_size(get_queue_size_kb());
-    // SAFETY: `ShmemInitStruct` must be called with AddinShmemInitLock held.
-    unsafe {
-        let init_lock = &raw mut (*pg_sys::MainLWLockArray.add(ADDIN_SHMEM_INIT_LOCK)).lock;
-        pg_sys::LWLockAcquire(init_lock, pg_sys::LWLockMode::LW_EXCLUSIVE);
+    // SAFETY: plain read of a global; `MainLWLockArray` is allocated before the
+    // startup hook runs.
+    let array = unsafe { pg_sys::MainLWLockArray };
+    // SAFETY: `ADDIN_SHMEM_INIT_LOCK` is within the array (lwlocklist.h).
+    let padded = unsafe { array.add(ADDIN_SHMEM_INIT_LOCK) };
+    // SAFETY: `padded` points to a valid `LWLockPadded`; only a raw field
+    // address is formed, no reference.
+    let init_lock = unsafe { &raw mut (*padded).lock };
+    // SAFETY: `ShmemInitStruct` must be called with AddinShmemInitLock held;
+    // this takes it. The lock pointer is valid (above):
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/storage/ipc/shmem.c
+    unsafe { pg_sys::LWLockAcquire(init_lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
-        let mut found = false;
-        let header =
-            pg_sys::ShmemInitStruct(SHMEM_NAME.as_ptr(), size, &mut found).cast::<Header>();
-        assert!(header.is_aligned(), "shared memory is not aligned");
-        if !found {
+    let mut found = false;
+    // SAFETY: lock held (above); `found` is a valid `bool` to write. Returns
+    // `size` bytes, MAXALIGN-aligned, valid until server shutdown (it raises an
+    // ERROR instead of returning null when out of memory).
+    let base = unsafe { pg_sys::ShmemInitStruct(SHMEM_NAME.as_ptr(), size, &raw mut found) };
+    let header = base.cast::<Header>();
+    assert!(!header.is_null(), "ShmemInitStruct returned null");
+    assert!(header.is_aligned(), "shared memory is not aligned");
+    if !found {
+        // SAFETY: first initialisation, with the init lock held, so no other
+        // process can have a reference into the region yet. The region is
+        // `HEADER_BYTES + capacity` bytes long and suitably aligned (asserted
+        // above), and this is the only writer.
+        unsafe {
             header.write(Header {
                 state: UnsafeCell::new(RingState::new()),
                 capacity: (size - HEADER_BYTES) as u64,
@@ -126,18 +169,48 @@ unsafe fn init_shared_header() {
                 dropped_spans: AtomicU64::new(0),
             });
         }
-        HEADER.store(header, Ordering::Release);
-        QUEUE_LOCK.store(
-            &raw mut (*pg_sys::GetNamedLWLockTranche(LWLOCK_TRANCHE.as_ptr())).lock,
-            Ordering::Release,
-        );
-
-        pg_sys::LWLockRelease(init_lock);
+        // SAFETY: the data area directly follows the header inside the
+        // allocation (`size` bytes in total).
+        let data = unsafe { base.cast::<u8>().add(HEADER_BYTES) };
+        // SAFETY: `size - HEADER_BYTES` bytes at `data` lie in the allocation.
+        // Zeroing makes every byte initialised, which `with_ring` relies on
+        // when it forms a `&mut [u8]` over the data area. Cost: touches (and so
+        // commits) the whole queue, up to 1 GiB at the maximum `queue_size_kb`,
+        // once at server start while holding AddinShmemInitLock.
+        unsafe { ptr::write_bytes(data, 0, size - HEADER_BYTES) };
     }
+    // `HEADER` and `QUEUE_LOCK` are per-process statics. They are set here in
+    // the postmaster, and backends and workers inherit them (and the mapping at
+    // the same address) through `fork`; the header was written under
+    // AddinShmemInitLock before that. The Release/Acquire ordering is therefore
+    // not what makes this correct; it only keeps the statics well-ordered if
+    // this hook ever runs in a process that other threads read from.
+    HEADER.store(header, Ordering::Release);
+
+    // SAFETY: the tranche was requested in `on_shmem_request`; Postgres sets up
+    // the named tranches before the startup hook. The result points into
+    // `MainLWLockArray` and is only used as a lock address.
+    let tranche = unsafe { pg_sys::GetNamedLWLockTranche(LWLOCK_TRANCHE.as_ptr()) };
+    // SAFETY: `tranche` points to the first of our (one) `LWLockPadded`.
+    QUEUE_LOCK.store(unsafe { &raw mut (*tranche).lock }, Ordering::Release);
+
+    // SAFETY: acquired above by this process and not yet released.
+    unsafe { pg_sys::LWLockRelease(init_lock) };
 }
 
 fn header() -> Option<&'static Header> {
-    // SAFETY: set once in the startup hook to memory that lives until shutdown.
+    // SAFETY: `HEADER` is null or set once, in the startup hook, to a
+    // `Header` that was fully initialised before the (release) store.
+    //  * non-null, aligned (asserted at init), initialised, correct type;
+    //  * the shared memory segment lives until the server shuts down, which
+    //    outlives any use of the reference ('static);
+    //  * nothing mutates the pointee while the `&Header` exists: `capacity` is
+    //    never written after init, `worker_proc_number`/`dropped_spans` are
+    //    atomics and `state` is an `UnsafeCell`, so interior mutation by other
+    //    processes is permitted;
+    //  * the reference only covers `HEADER_BYTES`; the data area behind it is
+    //    reached through the raw pointer instead (see `with_ring`).
+    // https://doc.rust-lang.org/std/ptr/index.html#pointer-to-reference-conversion
     unsafe { HEADER.load(Ordering::Acquire).as_ref() }
 }
 
@@ -153,7 +226,10 @@ impl LockGuard {
         if lock.is_null() {
             return None;
         }
-        // SAFETY: `lock` points to the valid named LWLock of this extension.
+        // SAFETY: `lock` was stored by `init_shared_header` and points to this
+        // extension's LWLock in shared memory, valid until shutdown. Callers are
+        // backends or the worker, which have a PGPROC (required to take LWLocks):
+        // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/storage/lmgr/lwlock.c
         unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
         Some(Self { lock })
     }
@@ -161,13 +237,16 @@ impl LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        // After an ERROR Postgres' cleanup has already released all LWLocks and
-        // reset InterruptHoldoffCount to 0; releasing again would be a bug.
-        // SAFETY: `lock` is valid; the holdoff count tells whether we still own it.
-        unsafe {
-            if pg_sys::InterruptHoldoffCount > 0 {
-                pg_sys::LWLockRelease(self.lock);
-            }
+        // After an ERROR, Postgres' abort cleanup (`LWLockReleaseAll`) already
+        // released every LWLock this process held; releasing again would fail
+        // ("lock is not held"). `LWLockHeldByMe` consults the same per-process
+        // list that cleanup empties, so it tells exactly whether we still own it.
+        // SAFETY: `lock` is the valid lock pointer given to `acquire`;
+        // `LWLockHeldByMe` only reads this process's own held-lock list.
+        let held = unsafe { pg_sys::LWLockHeldByMe(self.lock) };
+        if held {
+            // SAFETY: held by this process (checked above), so releasing is valid.
+            unsafe { pg_sys::LWLockRelease(self.lock) };
         }
     }
 }
@@ -183,17 +262,28 @@ pub fn with_ring<R>(f: impl FnOnce(&mut Ring) -> R) -> Option<R> {
     // `ShmemInitStruct`, which (unlike a reference to the header) has
     // provenance over the whole allocation.
     let base = HEADER.load(Ordering::Acquire);
-    // SAFETY: the lock gives exclusive access to the ring state and data area.
-    // The state is behind an UnsafeCell, so no `&mut` aliases the shared
-    // `&Header`; the data area directly follows the header, is `capacity` bytes
-    // long and does not overlap it.
-    let mut ring = unsafe {
-        let data = std::slice::from_raw_parts_mut(
-            base.cast::<u8>().add(HEADER_BYTES),
-            header.capacity as usize,
-        );
-        Ring::new(&mut *header.state.get(), data)
-    };
+    // SAFETY: the allocation is `HEADER_BYTES + capacity` bytes, so the data
+    // area starts inside it.
+    let data_ptr = unsafe { base.cast::<u8>().add(HEADER_BYTES) };
+    // SAFETY:
+    //  * non-null, aligned (u8), `capacity` bytes, zeroed at init, so initialised;
+    //  * valid for the lifetime of the reference: shared memory lives until
+    //    shutdown, and the slice is dropped (with `ring`) before `_guard`;
+    //  * exclusive: every access to the data area, in any process, happens
+    //    through this function, which holds the queue LWLock exclusively
+    //    until `_guard` drops after the last use of the slice;
+    //  * provenance: `data_ptr` derives from the whole-allocation pointer, and
+    //    the slice does not overlap the `Header` (it starts after it);
+    //  * `capacity` fits in `isize` (it is at most `queue_size_kb` KiB).
+    let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, header.capacity as usize) };
+    // SAFETY: `state` is only ever accessed here, under
+    // the exclusive queue lock and until `_guard` drops, so no other reference
+    // (in this or another process) exists. The `UnsafeCell` makes mutation
+    // through the shared `&Header` legal. Aligned (offset 0 of a repr(C),
+    // 8-aligned struct), initialised, and the pointer has provenance over
+    // exactly `size_of::<RingState>()` bytes.
+    let state = unsafe { &mut *header.state.get() };
+    let mut ring = Ring::new(state, data);
     Some(f(&mut ring))
 }
 
@@ -260,15 +350,23 @@ pub fn drain_into(out: &mut Vec<u8>, max_bytes: usize) -> Result<usize, Corrupte
 /// after an ERROR or FATAL, via `before_shmem_exit`).
 pub fn register_worker() {
     let Some(header) = header() else { return };
-    // SAFETY: `MyProcNumber` is valid in any process attached to shared memory.
+    // SAFETY: plain read of a global that is set once during process start-up
+    // (`InitProcess`) and valid for any process attached to shared memory.
     let proc_number = unsafe { pg_sys::MyProcNumber };
     header
         .worker_proc_number
         .store(proc_number, Ordering::Release);
-    // SAFETY: the callback is a plain function.
-    unsafe { pg_sys::before_shmem_exit(Some(unregister_worker_on_exit), pg_sys::Datum::from(0)) };
+    // SAFETY: the callback is a plain `extern "C-unwind"` function that ignores
+    // its argument. Registration is valid in a process attached to shared memory.
+    unsafe {
+        pg_sys::before_shmem_exit(Some(unregister_worker_on_exit), pg_sys::Datum::from(0));
+    }
 }
 
+/// # Safety
+///
+/// Must only be called by Postgres as a `before_shmem_exit` callback; it
+/// touches nothing but the atomics in the shared header.
 unsafe extern "C-unwind" fn unregister_worker_on_exit(_code: i32, _arg: pg_sys::Datum) {
     if let Some(header) = header() {
         header
@@ -284,17 +382,31 @@ unsafe extern "C-unwind" fn unregister_worker_on_exit(_code: i32, _arg: pg_sys::
 pub fn wake_worker() {
     let Some(header) = header() else { return };
     let proc_number = header.worker_proc_number.load(Ordering::Acquire);
-    // SAFETY: `ProcGlobal` is set up before any backend runs; the index is
-    // checked against the size of the PGPROC array. `SetLatch` is safe to call
-    // from any process on a shared latch.
-    unsafe {
-        let globals = pg_sys::ProcGlobal;
-        if proc_number < 0 || globals.is_null() || proc_number as u32 >= (*globals).allProcCount {
-            return;
-        }
-        let proc = (*globals).allProcs.add(proc_number as usize);
-        pg_sys::SetLatch(&raw mut (*proc).procLatch);
+    // SAFETY: `ProcGlobal` is a plain global, set in the postmaster
+    // (`InitProcGlobal`) before any other process exists.
+    let globals = unsafe { pg_sys::ProcGlobal };
+    if proc_number < 0 || globals.is_null() {
+        return;
     }
+    // SAFETY: `globals` is non-null and points to the shared `PROC_HDR`; a
+    // by-value read of a field, no reference is formed.
+    let proc_count = unsafe { (*globals).allProcCount };
+    if proc_number as u32 >= proc_count {
+        return;
+    }
+    // SAFETY: field read through the valid `globals`; no reference is formed.
+    let all_procs = unsafe { (*globals).allProcs };
+    // SAFETY: `allProcs` points to an array of `allProcCount` PGPROCs, and
+    // `proc_number` is below that count:
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/storage/lmgr/proc.c
+    let proc = unsafe { all_procs.add(proc_number as usize) };
+    // SAFETY: `proc` is a valid PGPROC (above); only a raw field address is formed.
+    let latch = unsafe { &raw mut (*proc).procLatch };
+    // SAFETY: `procLatch` is a shared latch initialised for every PGPROC at
+    // startup; `SetLatch` may be called by any process on a shared latch, and
+    // does nothing for a slot without an owner:
+    // https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/storage/ipc/latch.c
+    unsafe { pg_sys::SetLatch(latch) };
 }
 
 #[cfg(test)]
@@ -327,13 +439,18 @@ mod tests {
 
     #[pg_test]
     fn addin_shmem_init_lock_index_names_the_expected_lock() {
-        // SAFETY: `MainLWLockArray` is initialised in every backend; the name
-        // is a static string owned by Postgres.
-        let name = unsafe {
-            let lock = &raw const (*pg_sys::MainLWLockArray.add(ADDIN_SHMEM_INIT_LOCK)).lock;
-            let tranche = (*lock).tranche;
-            CStr::from_ptr(pg_sys::GetLWLockIdentifier(pg_sys::PG_WAIT_LWLOCK, tranche))
-        };
+        // SAFETY: plain read of a global, initialised in every backend.
+        let array = unsafe { pg_sys::MainLWLockArray };
+        // SAFETY: the index is within the array's fixed part.
+        let padded = unsafe { array.add(ADDIN_SHMEM_INIT_LOCK) };
+        // SAFETY: `padded` is valid; only a raw field address is formed.
+        let lock = unsafe { &raw const (*padded).lock };
+        // SAFETY: `lock` is valid for reads; plain field read.
+        let tranche = unsafe { (*lock).tranche };
+        // SAFETY: returns a NUL-terminated string that Postgres owns.
+        let identifier = unsafe { pg_sys::GetLWLockIdentifier(pg_sys::PG_WAIT_LWLOCK, tranche) };
+        // SAFETY: valid NUL-terminated static string (above), only read here.
+        let name = unsafe { CStr::from_ptr(identifier) };
         assert_eq!(name.to_str().unwrap(), "AddinShmemInit");
     }
 
