@@ -257,7 +257,8 @@ enum Outcome {
     Compared(compare::Comparison, bool),
     /// The query failed with plugin on and off: a generator problem.
     GeneratorError(String),
-    /// Timed out with plugin on and off: a generator problem.
+    /// Timed out with the plugin on and off, or came close to the limit
+    /// without it: a generator problem.
     GeneratorTimeout,
     /// Failed or timed out only with the plugin on.
     PluginOnly(String),
@@ -346,19 +347,33 @@ fn run_case(case: &Case, timeout_ms: u64, timings: &mut Timings) -> Outcome {
     }
     match explain(case, true, timeout_ms, timings) {
         Ok(first) => Outcome::Compared(timed_compare(timings, &first), false),
-        Err(on_error) => match explain(case, false, timeout_ms, timings) {
-            Err(off_error) if is_canceled(&on_error) && is_canceled(&off_error) => {
-                Outcome::GeneratorTimeout
-            }
-            Err(off_error) => Outcome::GeneratorError(off_error),
-            Ok(_) if is_canceled(&on_error) => match explain(case, true, timeout_ms, timings) {
-                Ok(retry) => Outcome::Compared(timed_compare(timings, &retry), true),
-                Err(retry_error) => {
-                    Outcome::PluginOnly(format!("{on_error}; retry: {retry_error}"))
+        Err(on_error) => {
+            let off_started = Instant::now();
+            let off = explain(case, false, timeout_ms, timings);
+            let off_took = off_started.elapsed();
+            match off {
+                Err(off_error) if is_canceled(&on_error) && is_canceled(&off_error) => {
+                    Outcome::GeneratorTimeout
                 }
-            },
-            Ok(_) => Outcome::PluginOnly(on_error),
-        },
+                Err(off_error) => Outcome::GeneratorError(off_error),
+                // A case that takes about the timeout without the plugin too is
+                // too slow to tell the two apart: which run crosses the limit is
+                // noise (the plugin's cost is a few percent).
+                Ok(_)
+                    if is_canceled(&on_error)
+                        && off_took * 2 > Duration::from_millis(timeout_ms) =>
+                {
+                    Outcome::GeneratorTimeout
+                }
+                Ok(_) if is_canceled(&on_error) => match explain(case, true, timeout_ms, timings) {
+                    Ok(retry) => Outcome::Compared(timed_compare(timings, &retry), true),
+                    Err(retry_error) => {
+                        Outcome::PluginOnly(format!("{on_error}; retry: {retry_error}"))
+                    }
+                },
+                Ok(_) => Outcome::PluginOnly(on_error),
+            }
+        }
     }
 }
 
