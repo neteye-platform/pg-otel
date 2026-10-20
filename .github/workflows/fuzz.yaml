@@ -1,12 +1,18 @@
-# UNTESTED: never run on GitHub yet, smoke-test in a fork before enabling the schedule.
-#
-# Never triggered by pull_request or push, and not meant to be a required check.
+# UNTESTED: never run on GitHub yet, smoke-test in a fork before relying on it.
 #
 # Differential fuzzer (src/fuzz): random queries run as EXPLAIN (ANALYZE) and
 # are compared with the spans pg_otel builds. See the module docs for replay.
+#
+# Three profiles:
+# * pull request: one shard per PostgreSQL version, PR_MINUTES of fuzzing;
+# * schedule (daily): three shards per version, 120 minutes;
+# * manual: three shards per version, with the given seed and duration.
 name: Fuzz
 
 on:
+  pull_request:
+    branches:
+      - "**"
   workflow_dispatch:
     inputs:
       seed:
@@ -18,29 +24,35 @@ on:
         default: "120"
         type: string
   schedule:
-    - cron: "0 2 * * *" # daily; deliberately not triggered by pull requests
+    - cron: "0 2 * * *" # daily
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  # A new push to a PR supersedes the previous short run; long runs finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
+  # Minutes of fuzzing per job on a pull request (after the build).
+  # TEMPORARY: 60 to measure throughput on the GitHub runners. Revert the
+  # pull_request trigger, this value and the PR timeout before merging.
+  PR_MINUTES: "60"
 
 jobs:
   fuzz:
     name: fuzz (PostgreSQL ${{ matrix.pg }}, shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # Build (~30 min) + at most 240 min of fuzzing; below the 6 h cap.
-    timeout-minutes: 330
+    # Build (~30 min) + at most 240 min of fuzzing; below the 6 h cap. A PR
+    # run is a build plus PR_MINUTES (TEMPORARY: 120 for a one hour run).
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 120 || 330 }}
     strategy:
       fail-fast: false
       matrix:
         pg: [18, 19]
-        shard: [0, 1, 2]
+        shard: ${{ fromJSON(github.event_name == 'pull_request' && '[0]' || '[0, 1, 2]') }}
     env:
       PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
     steps:
@@ -54,14 +66,23 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           SHARD: ${{ matrix.shard }}
         run: |
-          if [ "$EVENT_NAME" = workflow_dispatch ]; then
-            base="$INPUT_SEED"
-            duration="$INPUT_DURATION"
-          else
-            # Scheduled: every run and shard explores something different.
-            base="$RUN_ID"
-            duration=120
-          fi
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              base="$INPUT_SEED"
+              duration="$INPUT_DURATION"
+              ;;
+            pull_request)
+              # Re-running a job keeps the run id, so it repeats the same
+              # cases; a new push explores new ones.
+              base="$RUN_ID"
+              duration="$PR_MINUTES"
+              ;;
+            *)
+              # Scheduled: every run and shard explores something different.
+              base="$RUN_ID"
+              duration=120
+              ;;
+          esac
           if ! [[ "$base" =~ ^[0-9]{1,12}$ ]]; then
             echo "::error::seed must be 1 to 12 digits"
             exit 1
