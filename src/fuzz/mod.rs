@@ -50,7 +50,7 @@ use pgrx::{
     prelude::*,
 };
 
-use crate::postgres::capture;
+use crate::{postgres::capture, shared};
 use compare::compare;
 use generate::Case;
 
@@ -322,6 +322,80 @@ enum Outcome {
     PluginOnly(String),
 }
 
+/// Running min, mean, standard deviation (Welford) and max of a series.
+#[derive(Default)]
+struct Series {
+    count: u64,
+    mean: f64,
+    /// Sum of squared distances from the mean.
+    m2: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Series {
+    fn add(&mut self, value: f64) {
+        self.count += 1;
+        if self.count == 1 {
+            (self.min, self.max) = (value, value);
+        } else {
+            self.min = self.min.min(value);
+            self.max = self.max.max(value);
+        }
+        let delta = value - self.mean;
+        self.mean += delta / self.count as f64;
+        self.m2 += delta * (value - self.mean);
+    }
+
+    fn stddev(&self) -> f64 {
+        if self.count < 2 {
+            0.0
+        } else {
+            (self.m2 / (self.count - 1) as f64).sqrt()
+        }
+    }
+
+    /// In microseconds, from values in nanoseconds.
+    fn summary_us(&self) -> String {
+        format!(
+            "n={} min={:.1} mean={:.1} stddev={:.1} max={:.1}",
+            self.count,
+            self.min / 1e3,
+            self.mean / 1e3,
+            self.stddev() / 1e3,
+            self.max / 1e3,
+        )
+    }
+}
+
+/// Per statement cost of collecting the spans (`pg_otel.collection_timing`).
+/// The fuzzer captures the spans instead of queueing them, so the queue lock and
+/// copy are not measured: only the build and encode phases are, and the total
+/// is their sum.
+#[derive(Default)]
+struct CollectionSeries {
+    build: Series,
+    encode: Series,
+    total: Series,
+}
+
+impl CollectionSeries {
+    /// Adds what the server measured between the stats `before` and `after`
+    /// one traced `EXPLAIN`; ignores runs that measured nothing.
+    fn add(&mut self, before: shared::CollectionStats, after: shared::CollectionStats) {
+        let statements = after.statements - before.statements;
+        if statements == 0 {
+            return;
+        }
+        let per_statement = |after: u64, before: u64| (after - before) as f64 / statements as f64;
+        let build = per_statement(after.total.build_ns, before.total.build_ns);
+        let encode = per_statement(after.total.encode_ns, before.total.encode_ns);
+        self.build.add(build);
+        self.encode.add(encode);
+        self.total.add(build + encode);
+    }
+}
+
 /// Wall-clock split of the run, reported at the end to see where time goes.
 #[derive(Default)]
 struct Timings {
@@ -338,6 +412,7 @@ struct Timings {
     reload: Duration,
     /// Cases that errored or timed out with the plugin on (then rerun off).
     failed_cases: Duration,
+    collection: CollectionSeries,
     /// Slowest cases: (wall time, index, query).
     slowest: Vec<(Duration, u64, String)>,
 }
@@ -361,6 +436,7 @@ fn explain(
         ))
         .unwrap();
         capture::start();
+        let stats_before = shared::collection_stats();
         Watchdog::get().arm(Duration::from_millis(timeout_ms));
         let result = PgTryBuilder::new(AssertUnwindSafe(|| {
             Spi::get_one::<pgrx::Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", case.query))
@@ -373,6 +449,11 @@ fn explain(
         .execute();
         Watchdog::get().disarm();
         let spans = capture::finish();
+        if tracing && result.is_ok() {
+            timings
+                .collection
+                .add(stats_before, shared::collection_stats());
+        }
         let document = result
             .expect("EXPLAIN failed")
             .expect("EXPLAIN returned no row")
@@ -495,6 +576,7 @@ mod tests {
         for table in generate::TABLE_NAMES {
             Spi::run(&generate::reload(table)).unwrap();
         }
+        Spi::run("SET pg_otel.collection_timing = on").unwrap();
         Spi::run(&format!(
             "SET pg_otel.max_plan_spans = {}",
             generate::DEFAULT_MAX_PLAN_SPANS
@@ -636,6 +718,14 @@ mod tests {
             secs(timings.reload),
             secs(timings.failed_cases),
         );
+        let collection = &timings.collection;
+        for (name, series) in [
+            ("build", &collection.build),
+            ("encode", &collection.encode),
+            ("total", &collection.total),
+        ] {
+            report += &format!("FUZZ collection_us {name} {}\n", series.summary_us());
+        }
         for (time, index, query) in &timings.slowest {
             report += &format!(
                 "FUZZ slowest {:.3}s index={index} query={query}\n",
