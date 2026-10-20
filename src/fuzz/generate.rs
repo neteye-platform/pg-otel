@@ -114,6 +114,8 @@ impl Case {
         let ((template, query), writes) = if gen_.0.u8(..100) < 10 {
             let (template, query, table) = gen_.dml();
             ((template, query), Some(table))
+        } else if gen_.0.u8(..100) < 25 {
+            (gen_.composed(), None)
         } else {
             (gen_.select(), None)
         };
@@ -385,6 +387,48 @@ impl Generator {
             ),
         };
         (format!("select{template}"), query)
+    }
+
+    /// A [`Self::select`] whose first column is a number, for the outer
+    /// query of [`Self::composed`] to filter and join on.
+    fn inner(&mut self) -> String {
+        loop {
+            let (template, query) = self.select();
+            // `SELECT now() > now()` and friends.
+            if template != "select30" {
+                return query;
+            }
+        }
+    }
+
+    /// One or two generated queries inside an outer one (one level deep), so
+    /// every plan the templates make also runs as a subquery, a CTE, the inner
+    /// side of a semi join, an InitPlan, or rescanned under a LATERAL.
+    fn composed(&mut self) -> (String, String) {
+        let form = self.0.u8(..7);
+        let q = self.inner();
+        let query = match form {
+            0 => format!("SELECT count(*) FROM ({q}) s"),
+            1 => format!(
+                "WITH s AS {}MATERIALIZED ({q}) SELECT count(*) FROM s",
+                self.pick(&["", "NOT "])
+            ),
+            2 => {
+                format!("SELECT x, count(*) FROM ({q}) s(x) GROUP BY x ORDER BY 2 DESC, 1 LIMIT 10")
+            }
+            3 => format!("SELECT a.id FROM a WHERE a.k IN (SELECT x FROM ({q}) s(x))"),
+            4 => format!(
+                "SELECT count(*) FROM ({q}) s1(x) JOIN ({}) s2(y) ON s1.x = s2.y",
+                self.inner()
+            ),
+            // Every node of `q` runs once per outer row (`loops` > 1).
+            5 => format!(
+                "SELECT o.n, s.c FROM (VALUES (1), (2), (3)) o(n), \
+                 LATERAL (SELECT count(*) AS c FROM ({q}) i(x) WHERE i.x >= o.n) s"
+            ),
+            _ => format!("SELECT * FROM a WHERE a.id = (SELECT max(x) FROM ({q}) s(x))"),
+        };
+        (format!("compose{form}"), query)
     }
 
     /// Like [`Self::select`], plus the table the query modifies.
