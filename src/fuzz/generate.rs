@@ -3,12 +3,13 @@
 
 use fastrand::Rng;
 
-/// Tables created by [`SCHEMA`] with the columns usable in predicates and joins.
-const TABLES: [(&str, &[&str]); 4] = [
-    ("a", &["id", "g", "k"]),
-    ("b", &["id", "a_id", "g"]),
-    ("c", &["id", "b_id", "v"]),
-    ("p", &["id", "g"]),
+/// Tables created by [`SCHEMA`] with the columns usable in predicates and
+/// joins, and the largest value of each (the smallest is 0 or 1).
+const TABLES: [(&str, &[(&str, u32)]); 4] = [
+    ("a", &[("id", 3000), ("g", 6), ("k", 99)]),
+    ("b", &[("id", 5000), ("a_id", 2999), ("g", 12)]),
+    ("c", &[("id", 800), ("b_id", 49), ("v", 99)]),
+    ("p", &[("id", 2999), ("g", 4)]),
 ];
 
 /// Deterministic test data (no `random()`), so the same case always plans and
@@ -28,20 +29,33 @@ INSERT INTO p SELECT i, i % 5 FROM generate_series(0, 2999) i;
 CREATE INDEX ON p (id);
 ANALYZE a; ANALYZE b; ANALYZE c; ANALYZE p";
 
-const ENABLE_GUCS: [&str; 13] = [
-    "enable_hashjoin",
-    "enable_mergejoin",
-    "enable_nestloop",
-    "enable_seqscan",
-    "enable_indexscan",
-    "enable_bitmapscan",
-    "enable_hashagg",
-    "enable_sort",
-    "enable_material",
-    "enable_memoize",
-    "enable_indexonlyscan",
-    "enable_partitionwise_join",
-    "enable_incremental_sort",
+/// Planner switches with the value that differs from their default (all
+/// exist in PostgreSQL 18 and 19).
+const ENABLE_GUCS: [(&str, &str); 24] = [
+    ("enable_hashjoin", "off"),
+    ("enable_mergejoin", "off"),
+    ("enable_nestloop", "off"),
+    ("enable_seqscan", "off"),
+    ("enable_indexscan", "off"),
+    ("enable_bitmapscan", "off"),
+    ("enable_hashagg", "off"),
+    ("enable_sort", "off"),
+    ("enable_material", "off"),
+    ("enable_memoize", "off"),
+    ("enable_indexonlyscan", "off"),
+    ("enable_incremental_sort", "off"),
+    ("enable_gathermerge", "off"),
+    ("enable_parallel_hash", "off"),
+    ("enable_parallel_append", "off"),
+    ("enable_async_append", "off"),
+    ("enable_tidscan", "off"),
+    ("enable_presorted_aggregate", "off"),
+    ("enable_group_by_reordering", "off"),
+    ("enable_distinct_reordering", "off"),
+    ("enable_self_join_elimination", "off"),
+    ("enable_partition_pruning", "off"),
+    ("enable_partitionwise_join", "on"),
+    ("enable_partitionwise_aggregate", "on"),
 ];
 
 /// One generated test case.
@@ -58,7 +72,8 @@ impl Case {
     pub fn generate(seed: u64) -> Self {
         let mut gen_ = Generator(Rng::with_seed(seed));
         let settings = gen_.settings();
-        let (template, query) = if gen_.0.u8(..100) < 15 {
+        // DML has few plan shapes (see `FUZZ templates`).
+        let (template, query) = if gen_.0.u8(..100) < 10 {
             gen_.dml()
         } else {
             gen_.select()
@@ -90,10 +105,15 @@ impl Generator {
     fn settings(&mut self) -> Vec<(&'static str, String)> {
         let mut settings = Vec::new();
         for _ in 0..self.0.usize(..=4) {
-            let name = *self.pick(&ENABLE_GUCS);
+            let (name, value) = *self.pick(&ENABLE_GUCS);
             if !settings.iter().any(|(n, _)| *n == name) {
-                settings.push((name, "off".to_owned()));
+                settings.push((name, value.to_owned()));
             }
+        }
+        // JIT-compiled expressions and tuple deforming (without the costly
+        // inlining and optimisation). No-op on a server built without LLVM.
+        if self.0.u8(..100) < 5 {
+            settings.push(("jit_above_cost", "0".to_owned()));
         }
         if self.0.u8(..100) < 25 {
             settings.push(("work_mem", format!("{}kB", self.pick(&[64, 256, 1024]))));
@@ -112,22 +132,29 @@ impl Generator {
         settings
     }
 
+    /// A bound that keeps none, about 1%, 10% or half, or all of the values
+    /// `0..=max`: the selectivities at which the planner changes plans.
+    fn bound(&mut self, max: u32) -> u32 {
+        let per_mille = *self.pick(&[0, 10, 100, 500, 1000]);
+        max * per_mille / 1000 + self.0.u32(0..=max / 100)
+    }
+
     fn predicate(&mut self, alias: &str, table: usize) -> String {
-        let column = format!("{alias}.{}", self.pick(TABLES[table].1));
+        let (name, max) = *self.pick(TABLES[table].1);
+        let column = format!("{alias}.{name}");
         match self.0.u8(..5) {
-            0 => format!("{column} < {}", self.0.u32(0..=3000)),
-            1 => format!("{column} = {}", self.0.u32(0..=20)),
+            0 => format!("{column} < {}", self.bound(max)),
+            1 => format!("{column} = {}", self.0.u32(0..=max)),
             2 => format!("{column} % {} = 0", self.0.u32(2..=9)),
             3 => format!(
                 "{column} IN ({}, {})",
-                self.0.u32(0..=9),
-                self.0.u32(10..=99)
+                self.0.u32(0..=max),
+                self.0.u32(0..=max)
             ),
-            _ => format!(
-                "{column} BETWEEN {} AND {}",
-                self.0.u32(0..=50),
-                self.0.u32(51..=500)
-            ),
+            _ => {
+                let low = self.0.u32(0..=max);
+                format!("{column} BETWEEN {low} AND {}", low + self.bound(max))
+            }
         }
     }
 
@@ -140,8 +167,8 @@ impl Generator {
         let mut from = format!("{} {}", TABLES[tables[0]].0, aliases[0]);
         for i in 1..n {
             let join = *self.pick(&["JOIN", "LEFT JOIN", "JOIN"]);
-            let left = self.pick(TABLES[tables[i - 1]].1);
-            let right = self.pick(TABLES[tables[i]].1);
+            let left = self.pick(TABLES[tables[i - 1]].1).0;
+            let right = self.pick(TABLES[tables[i]].1).0;
             from += &format!(
                 " {join} {} {} ON {}.{left} = {}.{right}",
                 TABLES[tables[i]].0,
@@ -165,7 +192,11 @@ impl Generator {
         let and_ = if filter.is_empty() { " WHERE" } else { " AND" };
         let mut cols = Vec::new();
         for i in 0..n {
-            cols.push(format!("{}.{}", aliases[i], self.pick(TABLES[tables[i]].1)));
+            cols.push(format!(
+                "{}.{}",
+                aliases[i],
+                self.pick(TABLES[tables[i]].1).0
+            ));
         }
         let first = &cols[0];
         let last = &cols[n - 1];
@@ -173,7 +204,13 @@ impl Generator {
         let t0 = &aliases[0];
         let m = self.0.u32(1..=12);
 
-        let template = self.0.u8(..40);
+        // Templates 27 to 31 (single-table scans and constants) have one
+        // plan shape each, so they share a single draw.
+        let template = match self.0.u8(..36) {
+            27 => 27 + self.0.u8(..5),
+            slot if slot > 27 => slot + 4,
+            slot => slot,
+        };
         let query = match template {
             0 | 1 => format!("SELECT {all} FROM {from}{where_}"),
             2 | 3 => {
@@ -234,7 +271,7 @@ impl Generator {
             // Incremental sort needs a presorted prefix.
             21 => format!(
                 "SELECT {t0}.* FROM {from}{where_} ORDER BY {t0}.{}, {t0}.id DESC LIMIT {}",
-                TABLES[tables[0]].1[1],
+                TABLES[tables[0]].1[1].0,
                 self.0.u32(1..=500)
             ),
             22 => format!(

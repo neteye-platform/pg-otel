@@ -56,14 +56,15 @@ use generate::Case;
 
 /// The first cases of master seed 1, see `fuzz_generator_is_stable`.
 const GOLDEN_CASES: [&str; 4] = [
-    "[enable_hashagg=off, enable_seqscan=off, enable_indexonlyscan=off, work_mem=1024kB] \
-     SELECT t0.g, t1.k FROM a t0 JOIN a t1 ON t0.id = t1.k WHERE t1.g BETWEEN 17 AND 431 ORDER BY 1 LIMIT 5",
-    "[max_parallel_workers_per_gather=0] \
-     SELECT * FROM (VALUES (1, 'x'), (11, 'y'), (3, 'z')) AS v(i, s) JOIN a ON a.id = v.i",
-    "[enable_hashagg=off, enable_seqscan=off, enable_indexscan=off] \
-     SELECT t0.g, t1.id FROM a t0 JOIN b t1 ON t0.k = t1.a_id WHERE t0.k = 10 AND t1.id BETWEEN 44 AND 348 \
-     AND t0.g > (SELECT avg(v) FROM c)",
-    "[] SELECT t0.* FROM a t0 JOIN a t1 ON t0.g = t1.g WHERE t0.k < 333 ORDER BY t0.g, t0.id DESC LIMIT 34",
+    "[enable_gathermerge=off, enable_bitmapscan=off, enable_group_by_reordering=off] \
+     SELECT id FROM p WHERE id < (SELECT 1590)",
+    "[work_mem=256kB, parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, \
+     min_parallel_index_scan_size=0] SELECT generate_series(1, t0.id % 2) FROM a t0 WHERE t0.k IN (15, 10)",
+    "[enable_incremental_sort=off, enable_hashagg=off, enable_material=off, parallel_setup_cost=0, \
+     parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] \
+     SELECT t0.g FROM b t0 WHERE t0.g = 5 ORDER BY 1 LIMIT 100",
+    "[parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, \
+     min_parallel_index_scan_size=0] SELECT * FROM a WHERE (k = 72 OR g = 2) AND id < 1206",
 ];
 
 /// Flaky timeouts tolerated in one run before it fails.
