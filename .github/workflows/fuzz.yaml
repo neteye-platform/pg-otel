@@ -30,7 +30,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Per run outside pull requests: one group per ref keeps only one pending
+  # run, so a second dispatch would cancel the queued one.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   # A new push to a PR supersedes the previous short run; long runs finish.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 

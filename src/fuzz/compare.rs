@@ -191,6 +191,32 @@ impl Walker<'_> {
         {
             self.report("parallel_aware", &node_type, &path, "differs".to_owned());
         }
+        if plan["Async Capable"].as_bool().unwrap_or(false)
+            != flag(span, "postgresql.plan.async_capable")
+        {
+            self.report("async_capable", &node_type, &path, "differs".to_owned());
+        }
+        // Both read the executor's own counters, which this harness never
+        // leaves half-finished.
+        if flag(span, "postgresql.plan.instrumentation_incomplete") {
+            self.report(
+                "instrumentation_incomplete",
+                &node_type,
+                &path,
+                "set".to_owned(),
+            );
+        }
+        // `ntuples2`, which EXPLAIN prints as a total (not per loop).
+        if node_type == "Index Only Scan" {
+            self.close(
+                "heap_fetches",
+                &node_type,
+                &path,
+                plan["Heap Fetches"].as_f64(),
+                number(span, "postgresql.instrumentation.secondary_rows"),
+                0.5,
+            );
+        }
 
         self.equal(
             "parent_relationship",
@@ -405,6 +431,18 @@ pub fn compare(explain: &Json, spans: &[SpanData]) -> Comparison {
         } else {
             roots.push(*span);
         }
+    }
+    // `max_plan_spans` is set far above any generated plan.
+    if attr(query, "postgresql.plan.spans_truncated").is_some() {
+        walker.report(
+            "spans_truncated",
+            "query",
+            "",
+            format!(
+                "{:?} spans omitted",
+                number(query, "postgresql.plan.spans_omitted")
+            ),
+        );
     }
     match roots[..] {
         [root] => walker.node(&document["Plan"], root, ""),

@@ -37,7 +37,7 @@ mod compare;
 mod generate;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     panic::AssertUnwindSafe,
     sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError},
     time::{Duration, Instant},
@@ -63,7 +63,9 @@ const MAX_FLAKY_TIMEOUTS: usize = 3;
 /// `enable_timeout_after` (whose `TimeoutId` would have to be copied by hand).
 /// So a thread sends SIGINT to the backend thread: Postgres' own
 /// `StatementCancelHandler` turns it into ERROR 57014 at the next
-/// `CHECK_FOR_INTERRUPTS`. The thread calls no Postgres function.
+/// `CHECK_FOR_INTERRUPTS`. The thread calls no Postgres function, and blocks
+/// all signals so that none meant for the process runs a Postgres handler on
+/// it (`wrapper_handler` in `pqsignal.c` checks the pid, not the thread).
 ///
 /// The signal is only ever sent with `state` locked and the deadline still set,
 /// and [`Watchdog::disarm`] clears the deadline under the same lock, so no
@@ -90,6 +92,7 @@ impl Watchdog {
             let backend = unsafe { libc::pthread_self() };
             let shared = Arc::clone(&state);
             std::thread::spawn(move || {
+                block_all_signals();
                 let (lock, condvar) = &*shared;
                 let mut state = lock_ignoring_poison(lock);
                 loop {
@@ -135,6 +138,19 @@ impl Watchdog {
         condvar.notify_all();
         state.fired
     }
+}
+
+/// Blocks every signal on the calling thread.
+fn block_all_signals() {
+    let mut all = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `sigfillset` initialises the set it is given; `pthread_sigmask`
+    // only reads it and changes the mask of the calling thread.
+    #[allow(clippy::multiple_unsafe_ops_per_block)]
+    let result = unsafe {
+        libc::sigfillset(all.as_mut_ptr());
+        libc::pthread_sigmask(libc::SIG_BLOCK, all.as_ptr(), std::ptr::null_mut())
+    };
+    assert_eq!(result, 0, "pthread_sigmask failed");
 }
 
 fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -306,7 +322,7 @@ fn explain(
             Spi::get_one::<pgrx::Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", case.query))
         }))
         .catch_others(|error| {
-            // Disarm and stop capturing before re-raising for `rolled_back`.
+            // Stop capturing before re-raising; `rolled_back` disarms.
             capture::finish();
             error.rethrow()
         })
@@ -354,6 +370,11 @@ fn run_case(case: &Case, timeout_ms: u64, timings: &mut Timings) -> Outcome {
             match off {
                 Err(off_error) if is_canceled(&on_error) && is_canceled(&off_error) => {
                     Outcome::GeneratorTimeout
+                }
+                // An error with the plugin, while the run without it got past
+                // that point and only hit the limit.
+                Err(off_error) if is_canceled(&off_error) => {
+                    Outcome::PluginOnly(format!("{on_error}; without the plugin: {off_error}"))
                 }
                 Err(off_error) => Outcome::GeneratorError(off_error),
                 // A case that takes about the timeout without the plugin too is
@@ -423,7 +444,7 @@ mod tests {
             (0u64, 0u64, 0u64, 0u64);
         let mut coverage: BTreeMap<String, u64> = BTreeMap::new();
         let mut timings = Timings::default();
-        let mut error_samples: HashMap<String, (u64, String)> = HashMap::new();
+        let mut error_samples: BTreeMap<String, (u64, String)> = BTreeMap::new();
 
         let mut flaky: Vec<String> = Vec::new();
         for index in first_case.. {

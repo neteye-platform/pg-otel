@@ -4,11 +4,11 @@
 use fastrand::Rng;
 
 /// Tables created by [`SCHEMA`] with the columns usable in predicates and joins.
-const TABLES: [(&str, [&str; 3]); 4] = [
-    ("a", ["id", "g", "k"]),
-    ("b", ["id", "a_id", "g"]),
-    ("c", ["id", "b_id", "v"]),
-    ("p", ["id", "g", "g"]),
+const TABLES: [(&str, &[&str]); 4] = [
+    ("a", &["id", "g", "k"]),
+    ("b", &["id", "a_id", "g"]),
+    ("c", &["id", "b_id", "v"]),
+    ("p", &["id", "g"]),
 ];
 
 /// Deterministic test data (no `random()`), so the same case always plans and
@@ -107,7 +107,7 @@ impl Generator {
     }
 
     fn predicate(&mut self, alias: &str, table: usize) -> String {
-        let column = format!("{alias}.{}", self.pick(&TABLES[table].1));
+        let column = format!("{alias}.{}", self.pick(TABLES[table].1));
         match self.0.u8(..5) {
             0 => format!("{column} < {}", self.0.u32(0..=3000)),
             1 => format!("{column} = {}", self.0.u32(0..=20)),
@@ -133,8 +133,8 @@ impl Generator {
         let mut from = format!("{} {}", TABLES[tables[0]].0, aliases[0]);
         for i in 1..n {
             let join = *self.pick(&["JOIN", "LEFT JOIN", "JOIN"]);
-            let left = self.pick(&TABLES[tables[i - 1]].1);
-            let right = self.pick(&TABLES[tables[i]].1);
+            let left = self.pick(TABLES[tables[i - 1]].1);
+            let right = self.pick(TABLES[tables[i]].1);
             from += &format!(
                 " {join} {} {} ON {}.{left} = {}.{right}",
                 TABLES[tables[i]].0,
@@ -158,11 +158,7 @@ impl Generator {
         let and_ = if filter.is_empty() { " WHERE" } else { " AND" };
         let mut cols = Vec::new();
         for i in 0..n {
-            cols.push(format!(
-                "{}.{}",
-                aliases[i],
-                self.pick(&TABLES[tables[i]].1)
-            ));
+            cols.push(format!("{}.{}", aliases[i], self.pick(TABLES[tables[i]].1)));
         }
         let first = &cols[0];
         let last = &cols[n - 1];
@@ -234,14 +230,14 @@ impl Generator {
                 self.0.u32(1..=500)
             ),
             22 => format!(
-                "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < {}) SELECT r.n, {first} FROM r JOIN {from} ON r.n = {first}{and_} true",
+                "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < {}) SELECT r.n, {first} FROM r JOIN {from} ON r.n = {first}{where_}",
                 self.0.u32(1..=200)
             ),
             23 => format!(
                 "SELECT * FROM (VALUES (1, 'x'), ({m}, 'y'), (3, 'z')) AS v(i, s) JOIN a ON a.id = v.i"
             ),
             24 => format!(
-                "SELECT s.g, {first} FROM generate_series(1, {}) s(g) JOIN {from} ON {first} = s.g{and_} true",
+                "SELECT s.g, {first} FROM generate_series(1, {}) s(g) JOIN {from} ON {first} = s.g{where_}",
                 self.0.u32(1..=500)
             ),
             25 => format!(
