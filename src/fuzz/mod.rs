@@ -56,10 +56,10 @@ use generate::Case;
 
 /// The first cases of master seed 1, see `fuzz_generator_is_stable`.
 const GOLDEN_CASES: [&str; 4] = [
-    "[enable_gathermerge=off, enable_bitmapscan=off, enable_group_by_reordering=off, parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] SELECT * FROM w ORDER BY id LIMIT 1127",
-    "[parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] SELECT * FROM a WHERE (k = 82 OR g = 4) AND id < 669",
-    "[enable_incremental_sort=off, enable_hashagg=off, enable_material=off] SELECT count(*) FROM (SELECT id FROM p WHERE id > (SELECT 876)) s",
-    "[parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] WITH x AS (SELECT t0.id AS v FROM p t0 JOIN p t1 ON t0.id = t1.id JOIN n t2 ON t1.id = t2.g WHERE t0.g = 0 AND t1.id = 534) SELECT * FROM x x1 JOIN x x2 ON x1.v = x2.v",
+    "[enable_gathermerge=off, enable_bitmapscan=off, enable_group_by_reordering=off, plan_cache_mode=force_custom_plan] SELECT * FROM a WHERE k = 34 AND g = 5",
+    "[plan_cache_mode=force_generic_plan, max_parallel_workers_per_gather=0] SELECT t0.id, count(*), sum(t1.g) FROM n t0 LEFT JOIN p t1 ON t0.id = t1.id WHERE t0.v BETWEEN 1193 AND 3207 AND t1.g % 5 = 0 GROUP BY 1 HAVING count(*) > 1 ORDER BY 1",
+    "[enable_incremental_sort=off, enable_hashagg=off, enable_material=off, parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] SELECT o.n, s.c FROM (VALUES (1), (2), (3)) o(n), LATERAL (SELECT count(*) AS c FROM (SELECT t0.g, t1.id FROM n t0 JOIN p t1 ON t0.id = t1.id WHERE t0.g > (SELECT avg(v) FROM c)) i(x) WHERE i.x >= o.n) s",
+    "[parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] SELECT a.id FROM a WHERE a.k IN (SELECT x FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 164) SELECT r.n, t0.g FROM r JOIN p t0 JOIN n t1 ON t0.id = t1.g ON r.n = t0.g WHERE t0.id < 1501 AND t1.v < 24) s(x))",
 ];
 
 /// Flaky timeouts tolerated in one run before it fails.
@@ -403,7 +403,16 @@ fn run_case(case: &Case, timeout_ms: u64, timings: &mut Timings) -> Outcome {
         was_flaky: bool,
     ) -> Outcome {
         let started = Instant::now();
-        let comparison = compare(document, spans, case.max_plan_spans());
+        let comparison = compare(
+            document,
+            spans,
+            case.max_plan_spans(),
+            // A custom plan is made for every execution.
+            case.query.starts_with("EXECUTE ")
+                && !case
+                    .settings
+                    .contains(&("plan_cache_mode", "force_custom_plan".to_owned())),
+        );
         let shape = compare::plan_shape(&document[0]["Plan"]);
         timings.compare += started.elapsed();
         Outcome::Compared(comparison, shape, was_flaky)

@@ -66,6 +66,7 @@ fn span_node_type(explain: &str) -> String {
         "Nested Loop" => "NestLoop",
         "Materialize" => "Material",
         "CTE Scan" => "CteScan",
+        "Table Function Scan" => "TableFuncScan",
         other => return format!("T_{}State", other.replace(' ', "")),
     };
     format!("T_{name}State")
@@ -218,12 +219,19 @@ impl Walker<'_> {
             );
         }
         // `ntuples2`, which EXPLAIN prints as a total (not per loop).
-        if node_type == "Index Only Scan" {
+        let secondary = match node_type.as_str() {
+            "Index Only Scan" => Some(("heap_fetches", "Heap Fetches")),
+            "ModifyTable" if plan.get("Conflicting Tuples").is_some() => {
+                Some(("conflicting_tuples", "Conflicting Tuples"))
+            }
+            _ => None,
+        };
+        if let Some((kind, key)) = secondary {
             self.close(
-                "heap_fetches",
+                kind,
                 &node_type,
                 &path,
-                plan["Heap Fetches"].as_f64(),
+                plan[key].as_f64(),
                 number(span, "postgresql.instrumentation.secondary_rows"),
                 0.5,
             );
@@ -456,8 +464,15 @@ fn shape_into(plan: &Json, out: &mut String) {
 
 /// Compares the `EXPLAIN` document (`[{"Plan": ..., "Execution Time": ...}]`)
 /// with the spans captured while it ran with `pg_otel.max_plan_spans` =
-/// `max_spans`.
-pub fn compare(explain: &Json, spans: &[SpanData], max_spans: usize) -> Comparison {
+/// `max_spans`. `may_reuse_plan`: the statement may run a cached plan, which
+/// is not planned again and so has no planning span (EXPLAIN still prints a
+/// planning time, of the plan cache lookup).
+pub fn compare(
+    explain: &Json,
+    spans: &[SpanData],
+    max_spans: usize,
+    may_reuse_plan: bool,
+) -> Comparison {
     let mut walker = Walker {
         children: HashMap::new(),
         out: Comparison::default(),
@@ -563,6 +578,7 @@ pub fn compare(explain: &Json, spans: &[SpanData], max_spans: usize) -> Comparis
                 );
             }
         }
+        (None, _) if may_reuse_plan => {}
         _ => walker.report(
             "planning_span",
             "query",

@@ -26,7 +26,7 @@ CREATE TABLE b (id int, a_id int, g int);
 CREATE TABLE c (id int, b_id int, v int);
 CREATE INDEX ON a (id); CREATE INDEX ON a (k); CREATE INDEX ON a (g);
 CREATE INDEX ON b (a_id); CREATE INDEX ON b (g);
-CREATE INDEX ON c (b_id);
+CREATE INDEX ON c (b_id); CREATE UNIQUE INDEX ON c (id);
 CREATE TABLE p (id int, g int) PARTITION BY RANGE (id);
 CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (1000);
 CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (1000) TO (2000);
@@ -38,7 +38,10 @@ DO $$ BEGIN FOR i IN 0..39 LOOP
 END LOOP; END $$;
 CREATE INDEX ON w (id);
 CREATE TABLE n (id int, g int, v int);
-CREATE INDEX ON n (g); CREATE INDEX ON n (v)";
+CREATE INDEX ON n (g); CREATE INDEX ON n (v);
+PREPARE fz_p(int) AS SELECT count(*) FROM p WHERE id < $1;
+PREPARE fz_w(int) AS SELECT * FROM w WHERE id = $1 OR id = $1 + 1000;
+PREPARE fz_j(int) AS SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id WHERE a.k = $1";
 
 /// The rows of each table: deterministic (no `random()`), so the same case
 /// always plans and executes the same way.
@@ -195,6 +198,13 @@ impl Generator {
         if self.0.u8(..100) < 5 {
             settings.push(("jit_above_cost", "0".to_owned()));
         }
+        // Generic plans of the prepared statements prune partitions when the
+        // executor starts.
+        match self.0.u8(..100) {
+            0..20 => settings.push(("plan_cache_mode", "force_generic_plan".to_owned())),
+            20..30 => settings.push(("plan_cache_mode", "force_custom_plan".to_owned())),
+            _ => {}
+        }
         // Cut the plan spans off: the omitted count, and which spans stay.
         if self.0.u8(..100) < 5 {
             settings.push(("pg_otel.max_plan_spans", self.0.u32(0..=20).to_string()));
@@ -295,7 +305,7 @@ impl Generator {
 
         // Templates 27 to 31 (single-table scans and constants) have one
         // plan shape each, so they share a single draw.
-        let template = match self.0.u8(..36) {
+        let template = match self.0.u8(..40) {
             27 => 27 + self.0.u8(..5),
             slot if slot > 27 => slot + 4,
             slot => slot,
@@ -433,11 +443,28 @@ impl Generator {
                 self.0.u32(0..=99),
                 self.0.u32(0..=6)
             ),
+            // No aggregate: Group (sorted input) or HashAggregate.
+            40 => format!("SELECT {first} FROM {from}{where_} GROUP BY 1"),
+            // MixedAggregate, or several sorts under one Aggregate.
+            41 => format!(
+                "SELECT {all}, count(*) FROM {from}{where_} GROUP BY {}({all})",
+                self.pick(&["ROLLUP", "CUBE", "GROUPING SETS"])
+            ),
+            42 => format!(
+                "SELECT {first}, j.jx FROM {from} JOIN JSON_TABLE('[{{\"x\": 1}}, {{\"x\": {m}}}, {{\"x\": 3}}]', \
+                 '$[*]' COLUMNS (jx int PATH '$.x')) j ON j.jx = {first}{where_}"
+            ),
+            43 => match self.0.u8(..3) {
+                0 => format!("EXECUTE fz_p({})", self.0.u32(0..=3000)),
+                1 => format!("EXECUTE fz_w({})", self.0.u32(0..=3999)),
+                _ => format!("EXECUTE fz_j({})", self.0.u32(0..=99)),
+            },
             // Parameterised inner side with few distinct keys: Memoize.
-            _ => format!(
+            39 => format!(
                 "SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.k WHERE a.id < {}",
                 self.0.u32(1..=3000)
             ),
+            _ => unreachable!("template {template}"),
         };
         (format!("select{template}"), query)
     }
@@ -447,8 +474,8 @@ impl Generator {
     fn inner(&mut self) -> String {
         loop {
             let (template, query) = self.select();
-            // `SELECT now() > now()` and friends.
-            if template != "select30" {
+            // `SELECT now() > now()` and friends, and EXECUTE (a statement).
+            if template != "select30" && template != "select43" {
                 return query;
             }
         }
@@ -493,7 +520,15 @@ impl Generator {
             0 => format!("INSERT INTO c SELECT id + 100000, b_id, v FROM c WHERE v < {v}"),
             1 => format!("UPDATE c SET v = v + 1 WHERE b_id < {b}"),
             2 => format!("DELETE FROM c WHERE v < {v}"),
-            3 => "INSERT INTO c VALUES (1, 1, 1) RETURNING *".to_owned(),
+            // Conflicting tuples (`ntuples2`), and the conflict filter.
+            3 => format!(
+                "INSERT INTO c SELECT id, b_id, v FROM c WHERE v < {v} ON CONFLICT (id) {} RETURNING *",
+                self.pick(&[
+                    "DO NOTHING",
+                    "DO UPDATE SET v = excluded.v + 1",
+                    "DO UPDATE SET v = excluded.v + 1 WHERE c.v % 2 = 0",
+                ])
+            ),
             4 => format!(
                 "UPDATE p SET id = id + 1 WHERE id < {}",
                 self.0.u32(1..=2999)
