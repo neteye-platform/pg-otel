@@ -588,3 +588,19 @@ pub fn compare(
     }
     walker.out
 }
+
+#[cfg(test)]
+mod tests {
+    /// EXPLAIN prints huge estimates as exact integer expansions; they must
+    /// parse to the double Postgres had (`serde_json` needs `float_roundtrip`
+    /// for that), or the span's exact `plan_rows` looks one ULP off.
+    #[test]
+    fn explain_numbers_parse_to_the_exact_double() {
+        // Plan Rows of a CI mismatch on PostgreSQL 18 and 19 (~1e23).
+        for exact in [1.1667294954425583e23_f64, 1.1618397078605909e23_f64] {
+            let printed = format!("{exact:.0}");
+            let document: serde_json::Value = serde_json::from_str(&printed).unwrap();
+            assert_eq!(document.as_f64(), Some(exact), "{printed}");
+        }
+    }
+}
