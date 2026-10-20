@@ -19,6 +19,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    name: lint (rustfmt, clippy)
+    runs-on: ubuntu-latest
+    env:
+      PG_CONFIG: /usr/lib/postgresql/19/bin/pg_config
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install PostgreSQL 19 server headers
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y -v 19
+          sudo apt-get install -y --no-install-recommends postgresql-19 postgresql-server-dev-19 libclang-dev
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: lint
+      - name: Install cargo-pgrx
+        run: cargo install --locked cargo-pgrx --version =0.19.1
+      - name: Initialise pgrx against the system PostgreSQL
+        run: cargo pgrx init --pg19 "$PG_CONFIG"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   unit-tests:
     name: unit-tests (PostgreSQL ${{ matrix.pg }})
     runs-on: ubuntu-latest

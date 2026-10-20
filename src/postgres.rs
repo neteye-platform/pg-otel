@@ -611,15 +611,19 @@ pub unsafe fn plan_table_name(state: *const pg_sys::PlanState) -> Option<String>
         if nominal == 0 || estate.is_null() {
             return None;
         }
+        // SAFETY: `estate` is non-null (checked above); raw field read.
+        let range_table = unsafe { (*estate).es_range_table };
         // SAFETY: `es_range_table` is a valid pointer list of RTEs.
-        let rtes = unsafe { list_pointers::<pg_sys::RangeTblEntry>((*estate).es_range_table) };
+        let rtes = unsafe { list_pointers::<pg_sys::RangeTblEntry>(range_table) };
         // `nominal` is a 1-based rtable index.
         let rte = *rtes.get(usize::try_from(nominal).ok()?.checked_sub(1)?)?;
         if rte.is_null() {
             return None;
         }
-        // SAFETY: non-null range table entry; syscache lookups per contract.
-        return unsafe { plan_table_identifier((*rte).relid) };
+        // SAFETY: `rte` is non-null (checked above); raw field read.
+        let relid = unsafe { (*rte).relid };
+        // SAFETY: syscache lookups per contract.
+        return unsafe { plan_table_identifier(relid) };
     }
     if !is_scan {
         return None;
