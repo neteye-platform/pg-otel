@@ -68,6 +68,7 @@ pg_otel.min_duration_ms = 0 # -1 (default) disables tracing, 0 traces every stat
 | `pg_otel.query_text` | enum | `normalized` | **superuser** (or roles granted `SET` on the parameter) | `off`: no `db.query.text` attribute. `normalized`: literals are replaced with placeholders (quoted identifiers such as `"My Table"` are kept as is). `raw`: the query text as received (may contain sensitive data). The root span name always uses normalized text. When normalization fails (for example on `SQL_ASCII`), the name falls back to the operation and `normalized` produces no query text. |
 | `pg_otel.min_duration_ms` | int (ms) | `-1` | **superuser** (or roles granted `SET` on the parameter) | Only export spans for statements whose planning plus execution takes at least this long. `-1` disables tracing, `0` traces every statement. Restricted to superusers so that regular users cannot force tracing of everything. |
 | `pg_otel.max_plan_spans` | int | `1000` | **superuser** (or roles granted `SET` on the parameter) | Most plan node spans exported per statement (0 to 100000; 0 exports only the query span). Plans with more nodes (for example thousands of partitions) are cut off, see [Exported spans](#exported-spans). |
+| `pg_otel.collection_timing` | bool | `off` | **superuser** (or roles granted `SET` on the parameter) | Time the building, encoding and queueing of each traced statement's spans; see `pg_otel_collection_stats()` below. |
 | `pg_otel.queue_size_kb` | int (kB) | `1024` | server start only | Size of the shared-memory span queue in kilobytes (64 to 1048576). Needs a restart because shared memory is allocated at startup. See [How spans are exported](#how-spans-are-exported). |
 
 All `pg_otel.*` names are reserved: `SET` and `ALTER SYSTEM` reject unknown
@@ -120,6 +121,26 @@ create it.
 
 Raise `pg_otel.queue_size_kb` if this number grows. A single statement whose
 spans together exceed the queue size can never be exported.
+
+### Measuring the collection cost
+
+To see what building and queueing the spans adds to a statement, a superuser
+can turn on `pg_otel.collection_timing` (off by default; it reads the clock a
+few times per traced statement). The totals since server start are shown by
+
+```sql
+SELECT * FROM pg_otel_collection_stats();
+```
+
+which returns the number of statements measured and, in nanoseconds, the time
+spent building the span records (`build_ns`), encoding them (`encode_ns`) and
+taking the queue lock to copy them in (`publish_ns`). Divide by `statements`
+for the average. The totals are shared by all backends and are not reset. They
+do not include the per-row timing that `EXPLAIN ANALYZE`-style instrumentation
+adds to the query itself while it runs.
+
+`pg_otel_collection_stats()` and `pg_otel.collection_timing` were added in
+version 0.3.0; run `ALTER EXTENSION pg_otel UPDATE;` as described above.
 
 ## Usage
 
