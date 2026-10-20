@@ -12,12 +12,11 @@ const TABLES: [(&str, &[(&str, u32)]); 4] = [
     ("p", &[("id", 2999), ("g", 4)]),
 ];
 
-/// Deterministic test data (no `random()`), so the same case always plans and
-/// executes the same way. `ANALYZE` makes the plan choice stable.
+/// The tables, empty: [`reload`] fills them.
 pub const SCHEMA: &str = "
-CREATE TABLE a AS SELECT i AS id, i % 7 AS g, i % 100 AS k, md5(i::text) AS s FROM generate_series(1, 3000) i;
-CREATE TABLE b AS SELECT i AS id, (i * 7) % 3000 AS a_id, i % 13 AS g FROM generate_series(1, 5000) i;
-CREATE TABLE c AS SELECT i AS id, i % 50 AS b_id, (i * 37) % 100 AS v FROM generate_series(1, 800) i;
+CREATE TABLE a (id int, g int, k int, s text);
+CREATE TABLE b (id int, a_id int, g int);
+CREATE TABLE c (id int, b_id int, v int);
 CREATE INDEX ON a (id); CREATE INDEX ON a (k); CREATE INDEX ON a (g);
 CREATE INDEX ON b (a_id); CREATE INDEX ON b (g);
 CREATE INDEX ON c (b_id);
@@ -25,9 +24,46 @@ CREATE TABLE p (id int, g int) PARTITION BY RANGE (id);
 CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (1000);
 CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (1000) TO (2000);
 CREATE TABLE p3 PARTITION OF p FOR VALUES FROM (2000) TO (3000);
-INSERT INTO p SELECT i, i % 5 FROM generate_series(0, 2999) i;
-CREATE INDEX ON p (id);
-ANALYZE a; ANALYZE b; ANALYZE c; ANALYZE p";
+CREATE INDEX ON p (id)";
+
+/// The rows of each table: deterministic (no `random()`), so the same case
+/// always plans and executes the same way.
+const DATA: [(&str, &str); 4] = [
+    (
+        "a",
+        "INSERT INTO a SELECT i, i % 7, i % 100, md5(i::text) FROM generate_series(1, 3000) i",
+    ),
+    (
+        "b",
+        "INSERT INTO b SELECT i, (i * 7) % 3000, i % 13 FROM generate_series(1, 5000) i",
+    ),
+    (
+        "c",
+        "INSERT INTO c SELECT i, i % 50, (i * 37) % 100 FROM generate_series(1, 800) i",
+    ),
+    (
+        "p",
+        "INSERT INTO p SELECT i, i % 5 FROM generate_series(0, 2999) i",
+    ),
+];
+
+/// Every table of [`SCHEMA`].
+pub const TABLE_NAMES: [&str; 4] = ["a", "b", "c", "p"];
+
+/// SQL that brings `table` (one of [`TABLE_NAMES`]) back to its initial
+/// state: the same rows, no dead tuples, the same statistics (`ANALYZE`
+/// reads all rows of tables this small).
+///
+/// Run it in the (sub)transaction that created the table: only then does
+/// `TRUNCATE` empty the files in place, instead of leaving a new copy of
+/// them behind until commit (`ExecuteTruncateGuts` in `tablecmds.c`).
+pub fn reload(table: &str) -> String {
+    let (_, insert) = DATA
+        .iter()
+        .find(|(name, _)| *name == table)
+        .unwrap_or_else(|| panic!("unknown table {table}"));
+    format!("TRUNCATE {table}; {insert}; ANALYZE {table}")
+}
 
 /// Planner switches with the value that differs from their default (all
 /// exist in PostgreSQL 18 and 19).
@@ -65,6 +101,8 @@ pub struct Case {
     /// Which template the query came from, e.g. `select12`.
     pub template: String,
     pub query: String,
+    /// The table the query modifies (rolled back, but its dead tuples stay).
+    pub writes: Option<&'static str>,
 }
 
 impl Case {
@@ -73,15 +111,17 @@ impl Case {
         let mut gen_ = Generator(Rng::with_seed(seed));
         let settings = gen_.settings();
         // DML has few plan shapes (see `FUZZ templates`).
-        let (template, query) = if gen_.0.u8(..100) < 10 {
-            gen_.dml()
+        let ((template, query), writes) = if gen_.0.u8(..100) < 10 {
+            let (template, query, table) = gen_.dml();
+            ((template, query), Some(table))
         } else {
-            gen_.select()
+            (gen_.select(), None)
         };
         Self {
             settings,
             template,
             query,
+            writes,
         }
     }
 
@@ -347,7 +387,8 @@ impl Generator {
         (format!("select{template}"), query)
     }
 
-    fn dml(&mut self) -> (String, String) {
+    /// Like [`Self::select`], plus the table the query modifies.
+    fn dml(&mut self) -> (String, String, &'static str) {
         let v = self.0.u32(1..=99);
         let b = self.0.u32(1..=50);
         let template = self.0.u8(..9);
@@ -373,6 +414,11 @@ impl Generator {
                 self.0.u32(1..=3000)
             ),
         };
-        (format!("dml{template}"), query)
+        let table = match template {
+            0..=3 | 7 => "c",
+            6 => "a",
+            _ => "p",
+        };
+        (format!("dml{template}"), query, table)
     }
 }

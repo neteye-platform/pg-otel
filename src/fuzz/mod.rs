@@ -19,10 +19,10 @@
 //! Lines starting with `FUZZ` are meant to be grepped.
 //!
 //! A replay regenerates the same settings and query (the generator depends on
-//! the seed only), but not necessarily the same database state: earlier cases
-//! of a full run leave dead tuples, statistics and bloat behind (their DML is
-//! rolled back), so plans, timings and thus timeouts can differ. A mismatch
-//! that depends on such state needs the full run to reproduce.
+//! the seed only) on the same data: after a case that modifies a table (its
+//! DML is rolled back, but the dead tuples stay), that table is reloaded, so
+//! every case starts from the initial state. Only timings, and so timeouts,
+//! can differ between a replay and the full run.
 //!
 //! A case that times out only with the plugin on is run once more; if that
 //! passes it is reported as `FUZZ flaky-timeout` and only fails the run when
@@ -339,6 +339,8 @@ struct Timings {
     server: Duration,
     generate: Duration,
     compare: Duration,
+    /// Reloading the tables DML cases modified.
+    reload: Duration,
     /// Cases that errored or timed out with the plugin on (then rerun off).
     failed_cases: Duration,
     /// Slowest cases: (wall time, index, query).
@@ -485,6 +487,9 @@ mod tests {
         ));
 
         Spi::run(generate::SCHEMA).unwrap();
+        for table in generate::TABLE_NAMES {
+            Spi::run(&generate::reload(table)).unwrap();
+        }
         Spi::run("SET pg_otel.max_plan_spans = 100000").unwrap();
 
         let started = Instant::now();
@@ -526,6 +531,11 @@ mod tests {
             let mut found: Vec<(String, Vec<String>)> = Vec::new();
             let case_started = Instant::now();
             let outcome = run_case(&case, timeout_ms, &mut timings);
+            if let Some(table) = case.writes {
+                let reloaded = Instant::now();
+                Spi::run(&generate::reload(table)).unwrap();
+                timings.reload += reloaded.elapsed();
+            }
             let case_time = case_started.elapsed();
             if !matches!(outcome, Outcome::Compared(..)) {
                 timings.failed_cases += case_time;
@@ -607,13 +617,14 @@ mod tests {
         );
         let secs = |d: Duration| d.as_secs_f64();
         report += &format!(
-            "FUZZ timings_s generate={:.2} explain_on={:.2} explain_off={:.2} inner={:.2} server_reported={:.2} compare={:.2} failed_cases={:.2}\n",
+            "FUZZ timings_s generate={:.2} explain_on={:.2} explain_off={:.2} inner={:.2} server_reported={:.2} compare={:.2} reload={:.2} failed_cases={:.2}\n",
             secs(timings.generate),
             secs(timings.explain_on),
             secs(timings.explain_off),
             secs(timings.inner),
             secs(timings.server),
             secs(timings.compare),
+            secs(timings.reload),
             secs(timings.failed_cases),
         );
         for (time, index, query) in &timings.slowest {
@@ -657,8 +668,8 @@ mod tests {
                 findings.len() - MAX_REPORTED
             );
         }
-        // Rolled-back DML leaves dead tuples that cannot be vacuumed inside this one
-        // transaction, so the tables slowly bloat; report it to judge the drift.
+        // Must match the sizes right after the first load (the reload keeps
+        // the tables from bloating with dead tuples).
         let sizes = Spi::get_one::<String>(
             "SELECT string_agg(relname || '=' || pg_size_pretty(pg_table_size(oid)), ' ' ORDER BY relname) \
              FROM pg_class WHERE relname IN ('a', 'b', 'c', 'p1', 'p2', 'p3')",
