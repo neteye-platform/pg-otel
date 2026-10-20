@@ -56,10 +56,10 @@ use generate::Case;
 
 /// The first cases of master seed 1, see `fuzz_generator_is_stable`.
 const GOLDEN_CASES: [&str; 4] = [
-    "[enable_gathermerge=off, enable_bitmapscan=off, enable_group_by_reordering=off] SELECT * FROM b WHERE ctid >= '(0,1)' AND ctid < '(7,0)'",
-    "[work_mem=256kB, parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] SELECT t0.id FROM p t0 WHERE t0.g < 2 AND t0.id > (SELECT avg(v) FROM c)",
-    "[enable_incremental_sort=off, enable_hashagg=off, enable_material=off, parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] SELECT t0.g FROM a t0 UNION ALL SELECT id FROM c WHERE v < 51",
-    "[parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] SELECT * FROM p t0 WHERE t0.id % 6 = 0 FOR UPDATE",
+    "[enable_gathermerge=off, enable_bitmapscan=off, enable_group_by_reordering=off, parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] SELECT * FROM w ORDER BY id LIMIT 1127",
+    "[parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] SELECT * FROM a WHERE (k = 82 OR g = 4) AND id < 669",
+    "[enable_incremental_sort=off, enable_hashagg=off, enable_material=off] SELECT count(*) FROM (SELECT id FROM p WHERE id > (SELECT 876)) s",
+    "[parallel_setup_cost=0, parallel_tuple_cost=0, min_parallel_table_scan_size=0, min_parallel_index_scan_size=0] WITH x AS (SELECT t0.id AS v FROM p t0 JOIN p t1 ON t0.id = t1.id JOIN n t2 ON t1.id = t2.g WHERE t0.g = 0 AND t1.id = 534) SELECT * FROM x x1 JOIN x x2 ON x1.v = x2.v",
 ];
 
 /// Flaky timeouts tolerated in one run before it fails.
@@ -397,18 +397,19 @@ fn explain(
 
 fn run_case(case: &Case, timeout_ms: u64, timings: &mut Timings) -> Outcome {
     fn timed_compare(
+        case: &Case,
         timings: &mut Timings,
         (document, spans): &(serde_json::Value, Vec<SpanData>),
         was_flaky: bool,
     ) -> Outcome {
         let started = Instant::now();
-        let comparison = compare(document, spans);
+        let comparison = compare(document, spans, case.max_plan_spans());
         let shape = compare::plan_shape(&document[0]["Plan"]);
         timings.compare += started.elapsed();
         Outcome::Compared(comparison, shape, was_flaky)
     }
     match explain(case, true, timeout_ms, timings) {
-        Ok(first) => timed_compare(timings, &first, false),
+        Ok(first) => timed_compare(case, timings, &first, false),
         Err(on_error) => {
             let off_started = Instant::now();
             let off = explain(case, false, timeout_ms, timings);
@@ -433,7 +434,7 @@ fn run_case(case: &Case, timeout_ms: u64, timings: &mut Timings) -> Outcome {
                     Outcome::GeneratorTimeout
                 }
                 Ok(_) if is_canceled(&on_error) => match explain(case, true, timeout_ms, timings) {
-                    Ok(retry) => timed_compare(timings, &retry, true),
+                    Ok(retry) => timed_compare(case, timings, &retry, true),
                     Err(retry_error) => {
                         Outcome::PluginOnly(format!("{on_error}; retry: {retry_error}"))
                     }
@@ -485,7 +486,11 @@ mod tests {
         for table in generate::TABLE_NAMES {
             Spi::run(&generate::reload(table)).unwrap();
         }
-        Spi::run("SET pg_otel.max_plan_spans = 100000").unwrap();
+        Spi::run(&format!(
+            "SET pg_otel.max_plan_spans = {}",
+            generate::DEFAULT_MAX_PLAN_SPANS
+        ))
+        .unwrap();
 
         let started = Instant::now();
         let mut findings: Vec<Finding> = Vec::new();
@@ -667,7 +672,7 @@ mod tests {
         // the tables from bloating with dead tuples).
         let sizes = Spi::get_one::<String>(
             "SELECT string_agg(relname || '=' || pg_size_pretty(pg_table_size(oid)), ' ' ORDER BY relname) \
-             FROM pg_class WHERE relname IN ('a', 'b', 'c', 'p1', 'p2', 'p3')",
+             FROM pg_class WHERE relname IN ('a', 'b', 'c', 'p1', 'p2', 'p3', 'n', 'w0')",
         )
         .ok()
         .flatten()

@@ -5,12 +5,19 @@ use fastrand::Rng;
 
 /// Tables created by [`SCHEMA`] with the columns usable in predicates and
 /// joins, and the largest value of each (the smallest is 0 or 1).
-const TABLES: [(&str, &[(&str, u32)]); 4] = [
+const TABLES: [(&str, &[(&str, u32)]); 6] = [
     ("a", &[("id", 3000), ("g", 6), ("k", 99)]),
     ("b", &[("id", 5000), ("a_id", 2999), ("g", 12)]),
     ("c", &[("id", 800), ("b_id", 49), ("v", 99)]),
     ("p", &[("id", 2999), ("g", 4)]),
+    ("n", &[("id", 2000), ("g", 49), ("v", 2000)]),
+    // Last, see `WIDE`.
+    ("w", &[("id", 3999), ("g", 9)]),
 ];
+
+/// Index of `w` (40 partitions) in [`TABLES`]: only ever the first table of
+/// a query, and rarely, so joins of several stay fast.
+const WIDE: usize = TABLES.len() - 1;
 
 /// The tables, empty: [`reload`] fills them.
 pub const SCHEMA: &str = "
@@ -24,11 +31,18 @@ CREATE TABLE p (id int, g int) PARTITION BY RANGE (id);
 CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (1000);
 CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (1000) TO (2000);
 CREATE TABLE p3 PARTITION OF p FOR VALUES FROM (2000) TO (3000);
-CREATE INDEX ON p (id)";
+CREATE INDEX ON p (id);
+CREATE TABLE w (id int, g int) PARTITION BY RANGE (id);
+DO $$ BEGIN FOR i IN 0..39 LOOP
+    EXECUTE format('CREATE TABLE w%s PARTITION OF w FOR VALUES FROM (%s) TO (%s)', i, i * 100, i * 100 + 100);
+END LOOP; END $$;
+CREATE INDEX ON w (id);
+CREATE TABLE n (id int, g int, v int);
+CREATE INDEX ON n (g); CREATE INDEX ON n (v)";
 
 /// The rows of each table: deterministic (no `random()`), so the same case
 /// always plans and executes the same way.
-const DATA: [(&str, &str); 4] = [
+const DATA: [(&str, &str); 6] = [
     (
         "a",
         "INSERT INTO a SELECT i, i % 7, i % 100, md5(i::text) FROM generate_series(1, 3000) i",
@@ -45,10 +59,21 @@ const DATA: [(&str, &str); 4] = [
         "p",
         "INSERT INTO p SELECT i, i % 5 FROM generate_series(0, 2999) i",
     ),
+    // 40 partitions: plans with many nodes (and `max_plan_spans`).
+    (
+        "w",
+        "INSERT INTO w SELECT i, i % 10 FROM generate_series(0, 3999) i",
+    ),
+    // NULLs (a fifth of `g`) and a skewed `v` (80% are 1): estimates far off.
+    (
+        "n",
+        "INSERT INTO n SELECT i, CASE WHEN i % 5 = 0 THEN NULL ELSE i % 50 END, \
+         CASE WHEN i % 10 < 8 THEN 1 ELSE i END FROM generate_series(1, 2000) i",
+    ),
 ];
 
 /// Every table of [`SCHEMA`].
-pub const TABLE_NAMES: [&str; 4] = ["a", "b", "c", "p"];
+pub const TABLE_NAMES: [&str; 6] = ["a", "b", "c", "p", "n", "w"];
 
 /// SQL that brings `table` (one of [`TABLE_NAMES`]) back to its initial
 /// state: the same rows, no dead tuples, the same statistics (`ANALYZE`
@@ -64,6 +89,9 @@ pub fn reload(table: &str) -> String {
         .unwrap_or_else(|| panic!("unknown table {table}"));
     format!("TRUNCATE {table}; {insert}; ANALYZE {table}")
 }
+
+/// `pg_otel.max_plan_spans` when the case does not set it: above any plan.
+pub const DEFAULT_MAX_PLAN_SPANS: usize = 100_000;
 
 /// Planner switches with the value that differs from their default (all
 /// exist in PostgreSQL 18 and 19).
@@ -127,6 +155,16 @@ impl Case {
         }
     }
 
+    /// `pg_otel.max_plan_spans` of the case.
+    pub fn max_plan_spans(&self) -> usize {
+        self.settings
+            .iter()
+            .find(|(name, _)| *name == "pg_otel.max_plan_spans")
+            .map_or(DEFAULT_MAX_PLAN_SPANS, |(_, value)| {
+                value.parse().expect("generated as a number")
+            })
+    }
+
     /// `name=value, ...` of the non-default settings, for logs.
     pub fn settings_text(&self) -> String {
         self.settings
@@ -156,6 +194,10 @@ impl Generator {
         // inlining and optimisation). No-op on a server built without LLVM.
         if self.0.u8(..100) < 5 {
             settings.push(("jit_above_cost", "0".to_owned()));
+        }
+        // Cut the plan spans off: the omitted count, and which spans stay.
+        if self.0.u8(..100) < 5 {
+            settings.push(("pg_otel.max_plan_spans", self.0.u32(0..=20).to_string()));
         }
         if self.0.u8(..100) < 25 {
             settings.push(("work_mem", format!("{}kB", self.pick(&[64, 256, 1024]))));
@@ -203,7 +245,12 @@ impl Generator {
     /// The template label (for coverage) and the query.
     fn select(&mut self) -> (String, String) {
         let n = *self.pick(&[1, 1, 2, 2, 3]);
-        let tables: Vec<usize> = (0..n).map(|_| self.0.usize(..TABLES.len())).collect();
+        let tables: Vec<usize> = (0..n)
+            .map(|i| match self.0.u8(..100) {
+                0..5 if i == 0 => WIDE,
+                _ => self.0.usize(..WIDE),
+            })
+            .collect();
         let aliases: Vec<String> = (0..n).map(|i| format!("t{i}")).collect();
 
         let mut from = format!("{} {}", TABLES[tables[0]].0, aliases[0]);
@@ -355,15 +402,21 @@ impl Generator {
             31 => format!("SELECT * FROM a WHERE {} AND false", self.predicate("a", 0)),
             // Initial partition pruning (the bound is only known at executor start).
             32 | 33 => format!(
-                "SELECT {} FROM p WHERE id {} (SELECT {})",
+                "SELECT {} FROM {} WHERE id {} (SELECT {})",
                 *self.pick(&["count(*)", "id", "g"]),
+                *self.pick(&["p", "w"]),
                 *self.pick(&["<", ">", "="]),
-                self.0.u32(0..=3000)
+                self.0.u32(0..=4000)
             ),
-            34 => format!("SELECT * FROM p ORDER BY id LIMIT {}", self.0.u32(1..=2000)),
+            34 => format!(
+                "SELECT * FROM {} ORDER BY id LIMIT {}",
+                *self.pick(&["p", "w"]),
+                self.0.u32(1..=2000)
+            ),
             35 => format!(
-                "SELECT * FROM p WHERE g = {} ORDER BY id",
-                self.0.u32(0..=4)
+                "SELECT * FROM {} WHERE g = {} ORDER BY id",
+                *self.pick(&["p", "w"]),
+                self.0.u32(0..=9)
             ),
             36 => format!(
                 "SELECT {t0}.id, x.m FROM {from}, LATERAL (SELECT max(c.v) AS m FROM c WHERE c.b_id = {t0}.id) x{where_}"

@@ -74,6 +74,16 @@ fn span_node_type(explain: &str) -> String {
 struct Walker<'a> {
     children: HashMap<SpanId, Vec<&'a SpanData>>,
     out: Comparison,
+    /// `pg_otel.max_plan_spans`: only the nodes with a smaller pre-order
+    /// index (the order EXPLAIN prints them in) have a span.
+    max_spans: usize,
+}
+
+/// Number of nodes of the `EXPLAIN` plan tree `plan`.
+fn tree_size(plan: &Json) -> usize {
+    1 + plan["Plans"]
+        .as_array()
+        .map_or(0, |children| children.iter().map(tree_size).sum())
 }
 
 impl Walker<'_> {
@@ -85,7 +95,8 @@ impl Walker<'_> {
         });
     }
 
-    fn node(&mut self, plan: &Json, span: &SpanData, path: &str) {
+    /// `index` is the pre-order index of `plan`, below [`Walker::max_spans`].
+    fn node(&mut self, plan: &Json, span: &SpanData, path: &str, index: usize) {
         let node_type = plan["Node Type"].as_str().unwrap_or("?").to_owned();
         let path = format!("{path}/{node_type}");
         self.out.coverage.push(format!("node:{node_type}"));
@@ -325,7 +336,16 @@ impl Walker<'_> {
             ));
         }
 
-        let explain_children = plan["Plans"].as_array().map_or(&[][..], Vec::as_slice);
+        // The children that have a span: a prefix, being depth-first.
+        let mut explain_children = Vec::new();
+        let mut child_index = index + 1;
+        for child in plan["Plans"].as_array().map_or(&[][..], Vec::as_slice) {
+            if child_index >= self.max_spans {
+                break;
+            }
+            explain_children.push((child, child_index));
+            child_index += tree_size(child);
+        }
         let span_children = self
             .children
             .get(&span.span_context.span_id())
@@ -334,7 +354,7 @@ impl Walker<'_> {
         if explain_children.len() != span_children.len() {
             let explain_names: Vec<_> = explain_children
                 .iter()
-                .map(|c| c["Node Type"].as_str().unwrap_or("?"))
+                .map(|(c, _)| c["Node Type"].as_str().unwrap_or("?"))
                 .collect();
             let span_names: Vec<_> = span_children
                 .iter()
@@ -348,8 +368,8 @@ impl Walker<'_> {
             );
             return;
         }
-        for (child, child_span) in explain_children.iter().zip(span_children) {
-            self.node(child, child_span, &path);
+        for ((child, child_index), child_span) in explain_children.into_iter().zip(span_children) {
+            self.node(child, child_span, &path, child_index);
         }
     }
 
@@ -435,11 +455,13 @@ fn shape_into(plan: &Json, out: &mut String) {
 }
 
 /// Compares the `EXPLAIN` document (`[{"Plan": ..., "Execution Time": ...}]`)
-/// with the spans captured while it ran.
-pub fn compare(explain: &Json, spans: &[SpanData]) -> Comparison {
+/// with the spans captured while it ran with `pg_otel.max_plan_spans` =
+/// `max_spans`.
+pub fn compare(explain: &Json, spans: &[SpanData], max_spans: usize) -> Comparison {
     let mut walker = Walker {
         children: HashMap::new(),
         out: Comparison::default(),
+        max_spans,
     };
     let document = &explain[0];
 
@@ -476,20 +498,33 @@ pub fn compare(explain: &Json, spans: &[SpanData]) -> Comparison {
             roots.push(*span);
         }
     }
-    // `max_plan_spans` is set far above any generated plan.
-    if attr(query, "postgresql.plan.spans_truncated").is_some() {
+    let total = tree_size(&document["Plan"]);
+    let omitted = total.saturating_sub(max_spans);
+    walker.close(
+        "spans_omitted",
+        "query",
+        "",
+        (omitted > 0).then_some(omitted as f64),
+        number(query, "postgresql.plan.spans_omitted"),
+        0.0,
+    );
+    if (omitted > 0) != flag(query, "postgresql.plan.spans_truncated") {
         walker.report(
             "spans_truncated",
             "query",
             "",
-            format!(
-                "{:?} spans omitted",
-                number(query, "postgresql.plan.spans_omitted")
-            ),
+            format!("{omitted} of {total} nodes omitted"),
         );
     }
+    if omitted > 0 {
+        walker
+            .out
+            .coverage
+            .push("feature:spans_truncated".to_owned());
+    }
     match roots[..] {
-        [root] => walker.node(&document["Plan"], root, ""),
+        [] if max_spans == 0 => {}
+        [root] => walker.node(&document["Plan"], root, "", 0),
         _ => walker.report(
             "plan_roots",
             "query",
