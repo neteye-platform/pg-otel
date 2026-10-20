@@ -114,10 +114,11 @@ total since server start is available in SQL:
 SELECT pg_otel_dropped_spans();
 ```
 
-`pg_otel_dropped_spans()` was added in version 0.2.0. After installing the new
-binaries and restarting the server (the library is preloaded), run
-`ALTER EXTENSION pg_otel UPDATE;` in each database that has the extension to
-create it.
+The SQL functions are not part of the library's own setup: after installing
+and restarting the server, run [`sql/setup.sql`](sql/setup.sql) in each
+database where you want them (`psql -d <database> -f sql/setup.sql`). It is
+safe to run again, for example after upgrading, and it also contains an
+example configuration to adapt first.
 
 Raise `pg_otel.queue_size_kb` if this number grows. A single statement whose
 spans together exceed the queue size can never be exported.
@@ -139,8 +140,8 @@ for the average. The totals are shared by all backends and are not reset. They
 do not include the per-row timing that `EXPLAIN ANALYZE`-style instrumentation
 adds to the query itself while it runs.
 
-`pg_otel_collection_stats()` and `pg_otel.collection_timing` were added in
-version 0.3.0; run `ALTER EXTENSION pg_otel UPDATE;` as described above.
+`pg_otel_collection_stats()` is created by [`sql/setup.sql`](sql/setup.sql)
+too, see above.
 
 ## Usage
 
