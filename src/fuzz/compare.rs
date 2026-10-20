@@ -390,6 +390,50 @@ impl Walker<'_> {
     }
 }
 
+/// The shape of an `EXPLAIN` plan tree: node types with the properties that
+/// make the executor (and so the plugin) take a different path, without
+/// numbers or names. Two cases with the same shape exercise the same code.
+pub fn plan_shape(plan: &Json) -> String {
+    let mut out = String::new();
+    shape_into(plan, &mut out);
+    out
+}
+
+fn shape_into(plan: &Json, out: &mut String) {
+    out.push_str(plan["Node Type"].as_str().unwrap_or("?"));
+    for key in [
+        "Parent Relationship",
+        "Join Type",
+        "Strategy",
+        "Partial Mode",
+        "Operation",
+    ] {
+        if let Some(value) = plan[key].as_str() {
+            out.push(' ');
+            out.push_str(value);
+        }
+    }
+    if plan["Parallel Aware"].as_bool() == Some(true) {
+        out.push_str(" parallel");
+    }
+    if plan["Actual Loops"].as_f64() == Some(0.0) {
+        out.push_str(" never");
+    }
+    if plan["Subplans Removed"].as_f64().is_some_and(|n| n > 0.0) {
+        out.push_str(" pruned");
+    }
+    if let Some(children) = plan["Plans"].as_array() {
+        out.push('(');
+        for (i, child) in children.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            shape_into(child, out);
+        }
+        out.push(')');
+    }
+}
+
 /// Compares the `EXPLAIN` document (`[{"Plan": ..., "Execution Time": ...}]`)
 /// with the spans captured while it ran.
 pub fn compare(explain: &Json, spans: &[SpanData]) -> Comparison {

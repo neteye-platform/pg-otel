@@ -37,7 +37,8 @@ mod compare;
 mod generate;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
     panic::AssertUnwindSafe,
     sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError},
     time::{Duration, Instant},
@@ -52,6 +53,18 @@ use pgrx::{
 use crate::postgres::capture;
 use compare::compare;
 use generate::Case;
+
+/// The first cases of master seed 1, see `fuzz_generator_is_stable`.
+const GOLDEN_CASES: [&str; 4] = [
+    "[enable_hashagg=off, enable_seqscan=off, enable_indexonlyscan=off, work_mem=1024kB] \
+     SELECT t0.g, t1.k FROM a t0 JOIN a t1 ON t0.id = t1.k WHERE t1.g BETWEEN 17 AND 431 ORDER BY 1 LIMIT 5",
+    "[max_parallel_workers_per_gather=0] \
+     SELECT * FROM (VALUES (1, 'x'), (11, 'y'), (3, 'z')) AS v(i, s) JOIN a ON a.id = v.i",
+    "[enable_hashagg=off, enable_seqscan=off, enable_indexscan=off] \
+     SELECT t0.g, t1.id FROM a t0 JOIN b t1 ON t0.k = t1.a_id WHERE t0.k = 10 AND t1.id BETWEEN 44 AND 348 \
+     AND t0.g > (SELECT avg(v) FROM c)",
+    "[] SELECT t0.* FROM a t0 JOIN a t1 ON t0.g = t1.g WHERE t0.k < 333 ORDER BY t0.g, t0.id DESC LIMIT 34",
+];
 
 /// Flaky timeouts tolerated in one run before it fails.
 const MAX_FLAKY_TIMEOUTS: usize = 3;
@@ -180,6 +193,39 @@ fn discard_pending_cancel() {
     .execute();
 }
 
+/// Cases between two `FUZZ progress` lines, which show whether new plan
+/// shapes still turn up.
+const PROGRESS_EVERY: u64 = 10_000;
+
+/// Plan shapes seen so far, and which template found how many first.
+#[derive(Default)]
+struct Shapes {
+    /// Hashes of [`compare::plan_shape`] (deterministic: `DefaultHasher::new`).
+    seen: HashSet<u64>,
+    /// Per template: (cases compared, shapes it was the first to produce).
+    templates: BTreeMap<String, (u64, u64)>,
+    /// `seen.len()` at the previous progress line.
+    at_last_progress: usize,
+}
+
+impl Shapes {
+    fn record(&mut self, template: &str, shape: &str) {
+        let mut hasher = DefaultHasher::new();
+        shape.hash(&mut hasher);
+        let new = self.seen.insert(hasher.finish());
+        let entry = self.templates.entry(template.to_owned()).or_default();
+        entry.0 += 1;
+        entry.1 += u64::from(new);
+    }
+
+    /// `shapes=<total> new=<since the previous call>`.
+    fn progress(&mut self) -> String {
+        let new = self.seen.len() - self.at_last_progress;
+        self.at_last_progress = self.seen.len();
+        format!("shapes={} new={new}", self.seen.len())
+    }
+}
+
 /// Most distinct mismatch classes printed in the end.
 const MAX_REPORTED: usize = 20;
 
@@ -268,9 +314,9 @@ fn rolled_back<T>(f: impl FnOnce() -> T) -> Result<T, String> {
 
 /// What running one case produced.
 enum Outcome {
-    /// The flag is set when the first attempt timed out with the plugin on and
-    /// only the retry compared.
-    Compared(compare::Comparison, bool),
+    /// The comparison, the plan shape, and whether the first attempt timed out
+    /// with the plugin on and only the retry compared.
+    Compared(compare::Comparison, String, bool),
     /// The query failed with plugin on and off: a generator problem.
     GeneratorError(String),
     /// Timed out with the plugin on and off, or came close to the limit
@@ -355,14 +401,16 @@ fn run_case(case: &Case, timeout_ms: u64, timings: &mut Timings) -> Outcome {
     fn timed_compare(
         timings: &mut Timings,
         (document, spans): &(serde_json::Value, Vec<SpanData>),
-    ) -> compare::Comparison {
+        was_flaky: bool,
+    ) -> Outcome {
         let started = Instant::now();
         let comparison = compare(document, spans);
+        let shape = compare::plan_shape(&document[0]["Plan"]);
         timings.compare += started.elapsed();
-        comparison
+        Outcome::Compared(comparison, shape, was_flaky)
     }
     match explain(case, true, timeout_ms, timings) {
-        Ok(first) => Outcome::Compared(timed_compare(timings, &first), false),
+        Ok(first) => timed_compare(timings, &first, false),
         Err(on_error) => {
             let off_started = Instant::now();
             let off = explain(case, false, timeout_ms, timings);
@@ -387,7 +435,7 @@ fn run_case(case: &Case, timeout_ms: u64, timings: &mut Timings) -> Outcome {
                     Outcome::GeneratorTimeout
                 }
                 Ok(_) if is_canceled(&on_error) => match explain(case, true, timeout_ms, timings) {
-                    Ok(retry) => Outcome::Compared(timed_compare(timings, &retry), true),
+                    Ok(retry) => timed_compare(timings, &retry, true),
                     Err(retry_error) => {
                         Outcome::PluginOnly(format!("{on_error}; retry: {retry_error}"))
                     }
@@ -444,6 +492,7 @@ mod tests {
             (0u64, 0u64, 0u64, 0u64);
         let mut coverage: BTreeMap<String, u64> = BTreeMap::new();
         let mut timings = Timings::default();
+        let mut shapes = Shapes::default();
         let mut error_samples: BTreeMap<String, (u64, String)> = BTreeMap::new();
 
         let mut flaky: Vec<String> = Vec::new();
@@ -452,6 +501,14 @@ mod tests {
                 || deadline.is_some_and(|d| started.elapsed() >= d)
             {
                 break;
+            }
+            if index > first_case && (index - first_case).is_multiple_of(PROGRESS_EVERY) {
+                log_line(&format!(
+                    "progress cases={} {} elapsed_s={:.0}",
+                    index - first_case,
+                    shapes.progress(),
+                    started.elapsed().as_secs_f64()
+                ));
             }
             let seed = case_seed(master, index);
             let generated = Instant::now();
@@ -478,8 +535,9 @@ mod tests {
                 .sort_by_key(|slow| std::cmp::Reverse(slow.0));
             timings.slowest.truncate(5);
             match outcome {
-                Outcome::Compared(comparison, was_flaky) => {
+                Outcome::Compared(comparison, shape, was_flaky) => {
                     compared += 1;
+                    shapes.record(&case.template, &shape);
                     if was_flaky {
                         let line = format!(
                             "flaky-timeout case={index} seed={seed} master_seed={master} query={} replay: {}",
@@ -540,9 +598,10 @@ mod tests {
         let elapsed = started.elapsed().as_secs_f64();
         let mut report = format!(
             "FUZZ summary master_seed={master} cases={total} compared={compared} generator_errors={generator_errors} \
-             generator_timeouts={generator_timeouts} classes={} flaky_timeouts={} elapsed_s={elapsed:.1} cases_per_s={:.2}\n",
+             generator_timeouts={generator_timeouts} classes={} flaky_timeouts={} plan_shapes={} elapsed_s={elapsed:.1} cases_per_s={:.2}\n",
             findings.len(),
             flaky.len(),
+            shapes.seen.len(),
             total as f64 / elapsed.max(1e-9),
         );
         let secs = |d: Duration| d.as_secs_f64();
@@ -563,6 +622,13 @@ mod tests {
             );
         }
         report += &format!("FUZZ coverage {coverage:?}\n");
+        // `template=compared/first shapes`: what each template contributes.
+        let templates: Vec<String> = shapes
+            .templates
+            .iter()
+            .map(|(name, (cases, new))| format!("{name}={cases}/{new}"))
+            .collect();
+        report += &format!("FUZZ templates {}\n", templates.join(" "));
         for (message, (index, query)) in &error_samples {
             report += &format!("FUZZ generator_error index={index} {message} query={query}\n");
         }
@@ -624,5 +690,20 @@ mod tests {
         }
         assert_ne!(case_seed(7, 1), case_seed(7, 2));
         assert_ne!(case_seed(7, 1), case_seed(8, 1));
+    }
+
+    /// Pins the generator output, so a change of it (a template edit, a new
+    /// `fastrand`) is visible: replay commands from before it no longer
+    /// reproduce their case. Update the expected text when that is intended.
+    #[pg_test]
+    fn fuzz_generator_is_stable() {
+        let actual: Vec<String> = (0..4)
+            .map(|index| {
+                let case = Case::generate(case_seed(1, index));
+                format!("[{}] {}", case.settings_text(), case.query)
+            })
+            .collect();
+        let expected: [&str; 4] = GOLDEN_CASES;
+        assert_eq!(actual, expected, "actual: {actual:#?}");
     }
 }

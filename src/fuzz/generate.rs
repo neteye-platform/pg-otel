@@ -48,6 +48,8 @@ const ENABLE_GUCS: [&str; 13] = [
 pub struct Case {
     /// Settings that differ from the defaults, applied with `SET LOCAL`.
     pub settings: Vec<(&'static str, String)>,
+    /// Which template the query came from, e.g. `select12`.
+    pub template: String,
     pub query: String,
 }
 
@@ -56,12 +58,16 @@ impl Case {
     pub fn generate(seed: u64) -> Self {
         let mut gen_ = Generator(Rng::with_seed(seed));
         let settings = gen_.settings();
-        let query = if gen_.0.u8(..100) < 15 {
+        let (template, query) = if gen_.0.u8(..100) < 15 {
             gen_.dml()
         } else {
             gen_.select()
         };
-        Self { settings, query }
+        Self {
+            settings,
+            template,
+            query,
+        }
     }
 
     /// `name=value, ...` of the non-default settings, for logs.
@@ -125,7 +131,8 @@ impl Generator {
         }
     }
 
-    fn select(&mut self) -> String {
+    /// The template label (for coverage) and the query.
+    fn select(&mut self) -> (String, String) {
         let n = *self.pick(&[1, 1, 2, 2, 3]);
         let tables: Vec<usize> = (0..n).map(|_| self.0.usize(..TABLES.len())).collect();
         let aliases: Vec<String> = (0..n).map(|i| format!("t{i}")).collect();
@@ -166,7 +173,8 @@ impl Generator {
         let t0 = &aliases[0];
         let m = self.0.u32(1..=12);
 
-        match self.0.u8(..40) {
+        let template = self.0.u8(..40);
+        let query = match template {
             0 | 1 => format!("SELECT {all} FROM {from}{where_}"),
             2 | 3 => {
                 let having = *self.pick(&["", "HAVING count(*) > 1"]);
@@ -298,13 +306,15 @@ impl Generator {
                 "SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.k WHERE a.id < {}",
                 self.0.u32(1..=3000)
             ),
-        }
+        };
+        (format!("select{template}"), query)
     }
 
-    fn dml(&mut self) -> String {
+    fn dml(&mut self) -> (String, String) {
         let v = self.0.u32(1..=99);
         let b = self.0.u32(1..=50);
-        match self.0.u8(..9) {
+        let template = self.0.u8(..9);
+        let query = match template {
             0 => format!("INSERT INTO c SELECT id + 100000, b_id, v FROM c WHERE v < {v}"),
             1 => format!("UPDATE c SET v = v + 1 WHERE b_id < {b}"),
             2 => format!("DELETE FROM c WHERE v < {v}"),
@@ -325,6 +335,7 @@ impl Generator {
                 "INSERT INTO p SELECT id, g FROM p WHERE id < {}",
                 self.0.u32(1..=3000)
             ),
-        }
+        };
+        (format!("dml{template}"), query)
     }
 }
