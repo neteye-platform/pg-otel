@@ -1,18 +1,14 @@
-# UNTESTED: never run on GitHub yet, smoke-test in a fork before relying on it.
-#
 # Differential fuzzer (src/fuzz): random queries run as EXPLAIN (ANALYZE) and
 # are compared with the spans pg_otel builds. See the module docs for replay.
 #
-# Three profiles:
-# * pull request: one shard per PostgreSQL version, PR_MINUTES of fuzzing;
-# * schedule (daily): three shards per version, 120 minutes;
-# * manual: three shards per version, with the given seed and duration.
+# Deliberately not run on pull requests: it is not a required check, and an
+# hour of fuzzing is too long for one. Two profiles, three shards per
+# PostgreSQL version each:
+# * schedule (daily): 120 minutes;
+# * manual: the given seed and duration.
 name: Fuzz
 
 on:
-  pull_request:
-    branches:
-      - "**"
   workflow_dispatch:
     inputs:
       seed:
@@ -29,32 +25,20 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  # Per run outside pull requests: one group per ref keeps only one pending
-  # run, so a second dispatch would cancel the queued one.
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  # A new push to a PR supersedes the previous short run; long runs finish.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 env:
   CARGO_TERM_COLOR: always
-  # Minutes of fuzzing per job on a pull request (after the build).
-  # TEMPORARY: 60 to measure throughput on the GitHub runners. Revert the
-  # pull_request trigger, this value and the PR timeout before merging.
-  PR_MINUTES: "60"
 
 jobs:
   fuzz:
     name: fuzz (PostgreSQL ${{ matrix.pg }}, shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # Build (~30 min) + at most 240 min of fuzzing; below the 6 h cap. A PR
-    # run is a build plus PR_MINUTES (TEMPORARY: 120 for a one hour run).
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 120 || 330 }}
+    # Build (~30 min) + at most 240 min of fuzzing; below the 6 h cap.
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:
         pg: [18, 19]
-        shard: ${{ fromJSON(github.event_name == 'pull_request' && '[0]' || '[0, 1, 2]') }}
+        shard: [0, 1, 2]
     env:
       PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
     steps:
@@ -73,14 +57,9 @@ jobs:
               base="$INPUT_SEED"
               duration="$INPUT_DURATION"
               ;;
-            pull_request)
-              # Re-running a job keeps the run id, so it repeats the same
-              # cases; a new push explores new ones.
-              base="$RUN_ID"
-              duration="$PR_MINUTES"
-              ;;
             *)
               # Scheduled: every run and shard explores something different.
+              # Re-running a job keeps the run id, so it repeats the same cases.
               base="$RUN_ID"
               duration=120
               ;;

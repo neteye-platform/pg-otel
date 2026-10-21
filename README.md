@@ -406,3 +406,26 @@ scripts/integration-tests.sh --keep          # leave the containers up to debug
 The tests are `#[ignore]`d, so a plain `cargo test` does not need containers.
 CI runs the same tests against the runner's PostgreSQL and a collector
 container.
+
+## Fuzzing
+
+A differential fuzzer (`src/fuzz`) generates random queries, runs each as
+`EXPLAIN (ANALYZE, FORMAT JSON)` inside the test server and compares that plan
+with the spans pg_otel builds for the same execution (node types, relations,
+row counts, loops, timings and so on). It is a `pg_test` that does nothing
+unless asked to:
+
+```sh
+PG_OTEL_FUZZ_SEED=1 PG_OTEL_FUZZ_SECONDS=300 RUST_TEST_NOCAPTURE=1 \
+    cargo pgrx test pg18 --no-default-features fuzz_explain_vs_spans
+```
+
+Every failure prints a replay command with the master seed and the case index
+(`PG_OTEL_FUZZ_SEED=<seed> PG_OTEL_FUZZ_CASE=<index>`); the other settings and
+how a replay works are documented at the top of `src/fuzz/mod.rs`. The end
+summary also reports the plan shapes covered and the time spent collecting
+spans (see `pg_otel.collection_timing`).
+
+It is not part of the pull request checks. The `Fuzz` workflow runs it daily
+for two hours on PostgreSQL 18 and 19 (three shards each), and can be started
+by hand from the Actions tab with a seed and a duration.
