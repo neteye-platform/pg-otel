@@ -255,6 +255,26 @@ pub fn get_min_duration_ms() -> i32 {
     MIN_DURATION_MS.get()
 }
 
+const COLLECTION_TIMING_GUC: &CStr = c"pg_otel.collection_timing";
+static COLLECTION_TIMING: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+fn define_collection_timing_guc() {
+    GucRegistry::define_bool_guc(
+        COLLECTION_TIMING_GUC,
+        c"Measure how long building, encoding and queueing the spans takes",
+        c"The totals are shown by pg_otel_collection_stats(). Off by default: it reads the clock a few times per traced statement.",
+        &COLLECTION_TIMING,
+        // Superuser-only, like the other settings that change what every statement costs.
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+}
+
+/// Whether the collection phases are timed.
+pub fn get_collection_timing() -> bool {
+    COLLECTION_TIMING.get()
+}
+
 const QUEUE_SIZE_KB_GUC: &CStr = c"pg_otel.queue_size_kb";
 static QUEUE_SIZE_KB: GucSetting<i32> = GucSetting::<i32>::new(1024);
 
@@ -320,6 +340,7 @@ impl ExporterConfig {
         define_otlp_traceparent_guc();
         define_query_text_guc();
         define_min_duration_ms_guc();
+        define_collection_timing_guc();
         define_queue_size_kb_guc();
         define_max_plan_spans_guc();
     }

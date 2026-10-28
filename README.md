@@ -68,6 +68,7 @@ pg_otel.min_duration_ms = 0 # -1 (default) disables tracing, 0 traces every stat
 | `pg_otel.query_text` | enum | `normalized` | **superuser** (or roles granted `SET` on the parameter) | `off`: no `db.query.text` attribute. `normalized`: literals are replaced with placeholders (quoted identifiers such as `"My Table"` are kept as is). `raw`: the query text as received (may contain sensitive data). The root span name always uses normalized text. When normalization fails (for example on `SQL_ASCII`), the name falls back to the operation and `normalized` produces no query text. |
 | `pg_otel.min_duration_ms` | int (ms) | `-1` | **superuser** (or roles granted `SET` on the parameter) | Only export spans for statements whose planning plus execution takes at least this long. `-1` disables tracing, `0` traces every statement. Restricted to superusers so that regular users cannot force tracing of everything. |
 | `pg_otel.max_plan_spans` | int | `1000` | **superuser** (or roles granted `SET` on the parameter) | Most plan node spans exported per statement (0 to 100000; 0 exports only the query span). Plans with more nodes (for example thousands of partitions) are cut off, see [Exported spans](#exported-spans). |
+| `pg_otel.collection_timing` | bool | `off` | **superuser** (or roles granted `SET` on the parameter) | Time the building, encoding and queueing of each traced statement's spans; see `pg_otel_collection_stats()` below. |
 | `pg_otel.queue_size_kb` | int (kB) | `1024` | server start only | Size of the shared-memory span queue in kilobytes (64 to 1048576). Needs a restart because shared memory is allocated at startup. See [How spans are exported](#how-spans-are-exported). |
 
 All `pg_otel.*` names are reserved: `SET` and `ALTER SYSTEM` reject unknown
@@ -113,13 +114,34 @@ total since server start is available in SQL:
 SELECT pg_otel_dropped_spans();
 ```
 
-`pg_otel_dropped_spans()` was added in version 0.2.0. After installing the new
-binaries and restarting the server (the library is preloaded), run
-`ALTER EXTENSION pg_otel UPDATE;` in each database that has the extension to
-create it.
+The SQL functions are not part of the library's own setup: after installing
+and restarting the server, run [`sql/setup.sql`](sql/setup.sql) in each
+database where you want them (`psql -d <database> -f sql/setup.sql`). It is
+safe to run again, for example after upgrading, and it also contains an
+example configuration to adapt first.
 
 Raise `pg_otel.queue_size_kb` if this number grows. A single statement whose
 spans together exceed the queue size can never be exported.
+
+### Measuring the collection cost
+
+To see what building and queueing the spans adds to a statement, a superuser
+can turn on `pg_otel.collection_timing` (off by default; it reads the clock a
+few times per traced statement). The totals since server start are shown by
+
+```sql
+SELECT * FROM pg_otel_collection_stats();
+```
+
+which returns the number of statements measured and, in nanoseconds, the time
+spent building the span records (`build_ns`), encoding them (`encode_ns`) and
+taking the queue lock to copy them in (`publish_ns`). Divide by `statements`
+for the average. The totals are shared by all backends and are not reset. They
+do not include the per-row timing that `EXPLAIN ANALYZE`-style instrumentation
+adds to the query itself while it runs.
+
+`pg_otel_collection_stats()` is created by [`sql/setup.sql`](sql/setup.sql)
+too, see above.
 
 ## Usage
 
@@ -384,3 +406,26 @@ scripts/integration-tests.sh --keep          # leave the containers up to debug
 The tests are `#[ignore]`d, so a plain `cargo test` does not need containers.
 CI runs the same tests against the runner's PostgreSQL and a collector
 container.
+
+## Fuzzing
+
+A differential fuzzer (`src/fuzz`) generates random queries, runs each as
+`EXPLAIN (ANALYZE, FORMAT JSON)` inside the test server and compares that plan
+with the spans pg_otel builds for the same execution (node types, relations,
+row counts, loops, timings and so on). It is a `pg_test` that does nothing
+unless asked to:
+
+```sh
+PG_OTEL_FUZZ_SEED=1 PG_OTEL_FUZZ_SECONDS=300 RUST_TEST_NOCAPTURE=1 \
+    cargo pgrx test pg18 --no-default-features fuzz_explain_vs_spans
+```
+
+Every failure prints a replay command with the master seed and the case index
+(`PG_OTEL_FUZZ_SEED=<seed> PG_OTEL_FUZZ_CASE=<index>`); the other settings and
+how a replay works are documented at the top of `src/fuzz/mod.rs`. The end
+summary also reports the plan shapes covered and the time spent collecting
+spans (see `pg_otel.collection_timing`).
+
+It is not part of the pull request checks. The `Fuzz` workflow runs it daily
+for two hours on PostgreSQL 18 and 19 (three shards each), and can be started
+by hand from the Actions tab with a seed and a duration.

@@ -4,7 +4,7 @@ use std::{
     ffi::CStr,
     panic::AssertUnwindSafe,
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use opentelemetry::trace::SpanContext;
@@ -16,7 +16,10 @@ use pgrx::{
 use crate::{
     codec::encode_batch,
     compat,
-    config::{get_max_plan_spans, get_min_duration_ms, get_otlp_traceparent, get_query_text_mode},
+    config::{
+        get_collection_timing, get_max_plan_spans, get_min_duration_ms, get_otlp_traceparent,
+        get_query_text_mode,
+    },
     planning, shared,
     span::{
         ChildEdge, ParentContext, PlanChild, Relationship, SpanLink, SpanRecord, Timeline,
@@ -217,6 +220,7 @@ unsafe fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
     // can call into Postgres (relation names, query text sanitizing), which is
     // only allowed while no lock is held; the queue lock is taken once, at the
     // very end, by `publish_spans`.
+    let mut clock = Stopwatch::start();
     let query_span_id = random_span_id();
     let query_link = SpanLink {
         trace_id: parent.trace_id,
@@ -259,7 +263,33 @@ unsafe fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
         return;
     };
     spans.push(query_span);
-    publish_spans(spans);
+    let build_ns = clock.lap();
+    publish_spans(spans, &mut clock, build_ns);
+}
+
+/// Times the phases of collecting a statement's spans when
+/// `pg_otel.collection_timing` is on; reads no clock otherwise.
+struct Stopwatch(Option<Instant>);
+
+impl Stopwatch {
+    fn start() -> Self {
+        Self(get_collection_timing().then(Instant::now))
+    }
+
+    fn enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Nanoseconds since the start or the previous lap; 0 when not timing.
+    fn lap(&mut self) -> u64 {
+        let Some(previous) = self.0.as_mut() else {
+            return 0;
+        };
+        let now = Instant::now();
+        let elapsed = now.duration_since(*previous);
+        *previous = now;
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+    }
 }
 
 /// What `pg_otel.min_duration_ms` is compared with: planning plus execution.
@@ -281,12 +311,26 @@ fn meets_slow_query_threshold(duration_ns: i64, min_duration_ms: i32) -> bool {
 /// if the code raised an ERROR that we catch, the LWLock would leak (the guard
 /// in [`shared`] releases it on unwind only if `LWLockHeldByMe` says this
 /// backend still holds it), and every later publish would hang.
-fn publish_spans(spans: Vec<SpanRecord>) {
-    let Some(spans) = capture::divert(spans) else {
-        return;
-    };
+///
+/// Records the timing of the statement when `clock` is running; `build_ns` is
+/// the time already spent building the spans.
+fn publish_spans(spans: Vec<SpanRecord>, clock: &mut Stopwatch, build_ns: u64) {
+    // Also encoded when tests capture the spans, so the fuzzer measures it.
+    // The queue is not touched then, so `publish_ns` is only meaningful
+    // without capturing.
     let (batch, skipped) = encode_batch(&spans);
-    shared::publish(&batch, skipped);
+    let encode_ns = clock.lap();
+    if capture::divert(spans).is_some() {
+        shared::publish(&batch, skipped);
+    }
+    let publish_ns = clock.lap();
+    if clock.enabled() {
+        shared::record_collection_timing(shared::CollectionTiming {
+            build_ns,
+            encode_ns,
+            publish_ns,
+        });
+    }
 }
 
 /// The spans of a plan tree.
@@ -1464,6 +1508,33 @@ mod tests {
             (before..=after).contains(&from_sql),
             "{before} <= {from_sql} <= {after}"
         );
+    }
+
+    #[pg_test]
+    fn collection_timing_is_recorded_only_when_enabled() {
+        let statements = || {
+            Spi::get_one::<i64>("SELECT statements FROM pg_otel_collection_stats()")
+                .unwrap()
+                .unwrap()
+        };
+        Spi::run("SET pg_otel.min_duration_ms = 0").unwrap();
+
+        let before = statements();
+        for _ in 0..5 {
+            query_value("SELECT 1");
+        }
+        assert_eq!(statements(), before, "timing is off by default");
+
+        Spi::run("SET pg_otel.collection_timing = on").unwrap();
+        let before = crate::shared::collection_stats();
+        for _ in 0..5 {
+            query_value("SELECT 1");
+        }
+        let after = crate::shared::collection_stats();
+        // Other backends running tests concurrently may add to the totals.
+        assert!(after.statements >= before.statements + 5);
+        assert!(after.total.build_ns > before.total.build_ns);
+        assert!(after.total.encode_ns > before.total.encode_ns);
     }
 
     #[pg_test]

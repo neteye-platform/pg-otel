@@ -14,6 +14,8 @@ use crate::{
 mod codec;
 mod compat;
 mod config;
+#[cfg(any(test, feature = "pg_test"))]
+mod fuzz;
 mod planning;
 mod postgres;
 mod queue;
@@ -127,6 +129,29 @@ pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
 #[pg_extern]
 fn pg_otel_dropped_spans() -> i64 {
     i64::try_from(shared::dropped_spans()).unwrap_or(i64::MAX)
+}
+
+/// Totals of `pg_otel.collection_timing` since server start: the statements
+/// measured and the time spent building, encoding and queueing their spans, in
+/// nanoseconds.
+#[pg_extern]
+fn pg_otel_collection_stats() -> TableIterator<
+    'static,
+    (
+        name!(statements, i64),
+        name!(build_ns, i64),
+        name!(encode_ns, i64),
+        name!(publish_ns, i64),
+    ),
+> {
+    let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    let stats = shared::collection_stats();
+    TableIterator::once((
+        to_i64(stats.statements),
+        to_i64(stats.total.build_ns),
+        to_i64(stats.total.encode_ns),
+        to_i64(stats.total.publish_ns),
+    ))
 }
 
 /// # Safety

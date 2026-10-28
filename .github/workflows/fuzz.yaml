@@ -1,0 +1,154 @@
+# Differential fuzzer (src/fuzz): random queries run as EXPLAIN (ANALYZE) and
+# are compared with the spans pg_otel builds. See the module docs for replay.
+#
+# Deliberately not run on pull requests: it is not a required check, and an
+# hour of fuzzing is too long for one. Two profiles, three shards per
+# PostgreSQL version each:
+# * schedule (daily): 120 minutes;
+# * manual: the given seed and duration.
+name: Fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Base seed (1 to 12 digits). Each shard fuzzes with base*1000003+shard, printed first in the log.
+        required: true
+        type: string
+      duration_minutes:
+        description: Fuzzing time per job (1 to 240)
+        default: "120"
+        type: string
+  schedule:
+    - cron: "0 2 * * *" # daily
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (PostgreSQL ${{ matrix.pg }}, shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # Build (~30 min) + at most 240 min of fuzzing; below the 6 h cap.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [18, 19]
+        shard: [0, 1, 2]
+    env:
+      PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # User input only ever reaches scripts through env, and is validated.
+      - name: Choose the seed and the duration
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SEED: ${{ inputs.seed }}
+          INPUT_DURATION: ${{ inputs.duration_minutes }}
+          RUN_ID: ${{ github.run_id }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              base="$INPUT_SEED"
+              duration="$INPUT_DURATION"
+              ;;
+            *)
+              # Scheduled: every run and shard explores something different.
+              # Re-running a job keeps the run id, so it repeats the same cases.
+              base="$RUN_ID"
+              duration=120
+              ;;
+          esac
+          if ! [[ "$base" =~ ^[0-9]{1,12}$ ]]; then
+            echo "::error::seed must be 1 to 12 digits"
+            exit 1
+          fi
+          if ! [[ "$duration" =~ ^[0-9]{1,3}$ ]] || [ "$((10#$duration))" -lt 1 ] || [ "$((10#$duration))" -gt 240 ]; then
+            echo "::error::duration_minutes must be a number from 1 to 240"
+            exit 1
+          fi
+          # At most 12 digits * 1000003 stays far below 2^63, so no wrap-around.
+          seed=$(( 10#$base * 1000003 + SHARD ))
+          {
+            echo "PG_OTEL_FUZZ_SEED=$seed"
+            echo "PG_OTEL_FUZZ_SECONDS=$(( 10#$duration * 60 ))"
+          } >> "$GITHUB_ENV"
+          # Pass exactly this seed to PG_OTEL_FUZZ_SEED to reproduce locally.
+          echo "FUZZ pg=${{ matrix.pg }} shard=$SHARD master_seed=$seed seconds=$(( 10#$duration * 60 ))"
+      - name: Install PostgreSQL ${{ matrix.pg }} server headers
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y -v ${{ matrix.pg }}
+          sudo apt-get install -y --no-install-recommends postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} libclang-dev
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: pg${{ matrix.pg }}
+      - name: Install cargo-pgrx
+        run: cargo install --locked cargo-pgrx --version =0.19.1
+      - name: Initialise pgrx against the system PostgreSQL
+        run: cargo pgrx init --pg${{ matrix.pg }} "$PG_CONFIG"
+      - name: Let pgrx install the extension into the system PostgreSQL
+        run: sudo chown -R "$USER" "$("$PG_CONFIG" --sharedir)/extension" "$("$PG_CONFIG" --pkglibdir)"
+      - name: Fuzz
+        env:
+          PGRX_PG_CONFIG_PATH: ${{ env.PG_CONFIG }}
+          RUST_TEST_NOCAPTURE: "1"
+          PG_VERSION: ${{ matrix.pg }}
+        run: |
+          set -o pipefail
+          cargo test --locked --lib --no-default-features --features "pg$PG_VERSION" fuzz_explain_vs_spans 2>&1 | tee fuzz-raw.log
+      # Runs after success and failure; never fails itself, so the status of
+      # the job is the one of the Fuzz step.
+      - name: Report
+        if: always()
+        env:
+          PG_VERSION: ${{ matrix.pg }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set +e
+          # Keep only the harness lines, without terminal colours or the
+          # server log prefix (`... LOG:  TMSG: FUZZ ...`).
+          sed -e 's/\x1b\[[0-9;]*m//g' fuzz-raw.log | sed -n 's/^.*TMSG: \(FUZZ .*\)$/\1/p' > fuzz.log
+          title="pg_otel fuzz (pg$PG_VERSION shard $SHARD)"
+          {
+            echo "### $title"
+            echo '```'
+            grep -a -e '^FUZZ summary' -e '^FUZZ start' -e '^FUZZ MISMATCH' -e '^FUZZ   diff' -e '^FUZZ flaky-timeout' fuzz.log
+            if ! grep -aq '^FUZZ summary' fuzz.log; then
+              echo "NO SUMMARY (crash or early failure). Last case started:"
+              grep -a '^FUZZ case' fuzz.log | tail -n 1
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          escape() { sed -e 's/%/%25/g' -e 's/\r/%0D/g'; }
+          # One annotation per mismatch class of the end summary: the line
+          # (master seed, index, case seed, settings, query, replay command)
+          # followed by its diff lines, joined with an escaped newline.
+          awk '/^FUZZ MISMATCH signature=/ { if (n++ < 10) { if (msg != "") print msg; msg = $0 } else msg = ""; next }
+               /^FUZZ   diff / { if (msg != "") msg = msg "\\n" $0; next }
+               /^FUZZ (flaky|case|\.\.\.|table)/ { next }
+               END { if (msg != "") print msg }' fuzz.log |
+            while IFS= read -r line; do
+              printf '::error title=%s::%s\n' "$title" "$(printf '%s' "$line" | escape | sed 's/\\n/%0A/g')"
+            done
+          if ! grep -aq '^FUZZ summary' fuzz.log; then
+            last=$(grep -a '^FUZZ case' fuzz.log | tail -n 1 | escape)
+            echo "::error title=$title crashed::no summary, last case: $last"
+          fi
+          exit 0
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-pg${{ matrix.pg }}-shard${{ matrix.shard }}
+          path: |
+            fuzz.log
+            fuzz-raw.log
+          if-no-files-found: warn
+          retention-days: 14

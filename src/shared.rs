@@ -52,6 +52,18 @@ struct Header {
     worker_proc_number: AtomicI32,
     /// Spans discarded because the queue was full (or a span was too large).
     dropped_spans: AtomicU64,
+    /// Totals of `pg_otel.collection_timing`.
+    timing: TimingCounters,
+}
+
+/// Cumulative [`CollectionStats`], one atomic per field.
+#[repr(C)]
+#[derive(Default)]
+struct TimingCounters {
+    statements: AtomicU64,
+    build_ns: AtomicU64,
+    encode_ns: AtomicU64,
+    publish_ns: AtomicU64,
 }
 
 const HEADER_BYTES: usize = size_of::<Header>();
@@ -167,6 +179,7 @@ unsafe fn init_shared_header() {
                 capacity: (size - HEADER_BYTES) as u64,
                 worker_proc_number: AtomicI32::new(NO_WORKER),
                 dropped_spans: AtomicU64::new(0),
+                timing: TimingCounters::default(),
             });
         }
         // SAFETY: the data area directly follows the header inside the
@@ -205,8 +218,8 @@ fn header() -> Option<&'static Header> {
     //  * the shared memory segment lives until the server shuts down, which
     //    outlives any use of the reference ('static);
     //  * nothing mutates the pointee while the `&Header` exists: `capacity` is
-    //    never written after init, `worker_proc_number`/`dropped_spans` are
-    //    atomics and `state` is an `UnsafeCell`, so interior mutation by other
+    //    never written after init, `worker_proc_number`, `dropped_spans` and
+    //    `timing` are atomics and `state` is an `UnsafeCell`, so interior mutation by other
     //    processes is permitted;
     //  * the reference only covers `HEADER_BYTES`; the data area behind it is
     //    reached through the raw pointer instead (see `with_ring`).
@@ -337,6 +350,58 @@ fn count_dropped(spans: usize) {
 /// Total number of spans dropped since server start.
 pub fn dropped_spans() -> u64 {
     header().map_or(0, |header| header.dropped_spans.load(Ordering::Relaxed))
+}
+
+/// Time spent collecting the spans of a statement, in nanoseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollectionTiming {
+    /// Building the span records.
+    pub build_ns: u64,
+    /// Encoding them for the queue.
+    pub encode_ns: u64,
+    /// Taking the queue lock and copying the batch in.
+    pub publish_ns: u64,
+}
+
+/// What `pg_otel.collection_timing` has measured since server start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollectionStats {
+    /// Statements measured.
+    pub statements: u64,
+    pub total: CollectionTiming,
+}
+
+/// Adds the timing of one statement to the totals.
+pub fn record_collection_timing(timing: CollectionTiming) {
+    if let Some(header) = header() {
+        let counters = &header.timing;
+        counters.statements.fetch_add(1, Ordering::Relaxed);
+        counters
+            .build_ns
+            .fetch_add(timing.build_ns, Ordering::Relaxed);
+        counters
+            .encode_ns
+            .fetch_add(timing.encode_ns, Ordering::Relaxed);
+        counters
+            .publish_ns
+            .fetch_add(timing.publish_ns, Ordering::Relaxed);
+    }
+}
+
+/// The totals measured so far. The fields are read one by one, so a statement
+/// recorded concurrently can show up in some of them only.
+pub fn collection_stats() -> CollectionStats {
+    header().map_or_else(CollectionStats::default, |header| {
+        let counters = &header.timing;
+        CollectionStats {
+            statements: counters.statements.load(Ordering::Relaxed),
+            total: CollectionTiming {
+                build_ns: counters.build_ns.load(Ordering::Relaxed),
+                encode_ns: counters.encode_ns.load(Ordering::Relaxed),
+                publish_ns: counters.publish_ns.load(Ordering::Relaxed),
+            },
+        }
+    })
 }
 
 /// Moves up to `max_bytes` of whole records into `out`; see
