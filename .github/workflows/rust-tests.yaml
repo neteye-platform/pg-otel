@@ -1,0 +1,110 @@
+name: Rust Tests
+
+on:
+  pull_request:
+    branches:
+      - "**"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: lint (rustfmt, clippy)
+    runs-on: ubuntu-latest
+    env:
+      PG_CONFIG: /usr/lib/postgresql/19/bin/pg_config
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install PostgreSQL 19 server headers
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y -v 19
+          sudo apt-get install -y --no-install-recommends postgresql-19 postgresql-server-dev-19 libclang-dev
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: lint
+      - name: Install cargo-pgrx
+        run: cargo install --locked cargo-pgrx --version =0.19.1
+      - name: Initialise pgrx against the system PostgreSQL
+        run: cargo pgrx init --pg19 "$PG_CONFIG"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  unit-tests:
+    name: unit-tests (PostgreSQL ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [18, 19]
+    env:
+      PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install PostgreSQL ${{ matrix.pg }} server headers
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y -v ${{ matrix.pg }}
+          sudo apt-get install -y --no-install-recommends postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} libclang-dev
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: pg${{ matrix.pg }}
+      - name: Install cargo-pgrx
+        run: cargo install --locked cargo-pgrx --version =0.19.1
+      - name: Initialise pgrx against the system PostgreSQL
+        run: cargo pgrx init --pg${{ matrix.pg }} "$PG_CONFIG"
+      - name: Let pgrx install the extension into the system PostgreSQL
+        run: sudo chown -R "$USER" "$("$PG_CONFIG" --sharedir)/extension" "$("$PG_CONFIG" --pkglibdir)"
+      - name: Run unit and pg_test tests
+        env:
+          PGRX_PG_CONFIG_PATH: ${{ env.PG_CONFIG }}
+        run: cargo test --workspace --locked --all-targets --no-default-features --features pg${{ matrix.pg }}
+      # Runs in this job to reuse the build cache of the steps above. PostgreSQL
+      # is the runner's own, so the extension and server share one glibc; only
+      # the collector is a container. See tests/integration and
+      # scripts/integration-tests.sh for the local, fully containerised setup.
+      - name: Install the extension into the system PostgreSQL
+        run: cargo pgrx install --pg-config "$PG_CONFIG" --no-default-features --features pg${{ matrix.pg }}
+      - name: Start PostgreSQL
+        run: |
+          pgdata="$RUNNER_TEMP/pgdata"
+          "$(dirname "$PG_CONFIG")/initdb" -D "$pgdata" -A trust -U postgres
+          "$(dirname "$PG_CONFIG")/pg_ctl" -D "$pgdata" -l "$RUNNER_TEMP/postgres.log" -w \
+            -o "-p 5432 -c unix_socket_directories=$RUNNER_TEMP -c shared_preload_libraries=pg_otel" start
+      - name: Start the OpenTelemetry collector
+        run: |
+          mkdir -p "$RUNNER_TEMP/collector-out"
+          docker run -d --name collector --network host --user "$(id -u)" \
+            -v "$PWD/tests/integration/collector.yaml:/etc/otelcol/config.yaml:ro" \
+            -v "$RUNNER_TEMP/collector-out:/out" \
+            docker.io/otel/opentelemetry-collector:0.163.1 --config /etc/otelcol/config.yaml
+      - name: Run integration tests
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGDATABASE: postgres
+          COLLECTOR_HOST: localhost
+        run: |
+          export COLLECTOR_OUT_DIR="$RUNNER_TEMP/collector-out"
+          cargo test --locked --test integration --no-default-features --features pg${{ matrix.pg }} -- --include-ignored
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          docker logs collector || true
+          cat "$RUNNER_TEMP/postgres.log" || true
