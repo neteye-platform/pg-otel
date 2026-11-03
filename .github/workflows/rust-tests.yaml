@@ -4,9 +4,6 @@ on:
   pull_request:
     branches:
       - "**"
-  push:
-    branches:
-      - main
 
 permissions:
   contents: read
@@ -22,17 +19,22 @@ jobs:
   lint:
     name: lint (rustfmt, clippy)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       PG_CONFIG: /usr/lib/postgresql/19/bin/pg_config
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install PostgreSQL 19 server headers
         run: |
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y -v 19
           sudo apt-get install -y --no-install-recommends postgresql-19 postgresql-server-dev-19 libclang-dev
       - name: Install stable Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: lint
       - name: Install cargo-pgrx
@@ -47,6 +49,7 @@ jobs:
   unit-tests:
     name: unit-tests (PostgreSQL ${{ matrix.pg }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -54,14 +57,18 @@ jobs:
     env:
       PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install PostgreSQL ${{ matrix.pg }} server headers
         run: |
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y -v ${{ matrix.pg }}
           sudo apt-get install -y --no-install-recommends postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} libclang-dev
       - name: Install stable Rust toolchain
         run: rustup toolchain install stable --profile minimal --no-self-update
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: pg${{ matrix.pg }}
       - name: Install cargo-pgrx

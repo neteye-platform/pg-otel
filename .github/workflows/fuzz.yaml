@@ -42,7 +42,10 @@ jobs:
     env:
       PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # User input only ever reaches scripts through env, and is validated.
       - name: Choose the seed and the duration
         env:
@@ -86,7 +89,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} libclang-dev
       - name: Install stable Rust toolchain
         run: rustup toolchain install stable --profile minimal --no-self-update
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: pg${{ matrix.pg }}
       - name: Install cargo-pgrx
@@ -119,7 +123,7 @@ jobs:
           {
             echo "### $title"
             echo '```'
-            grep -a -e '^FUZZ summary' -e '^FUZZ start' -e '^FUZZ MISMATCH' -e '^FUZZ   diff' -e '^FUZZ flaky-timeout' fuzz.log
+            grep -a -e '^FUZZ summary' -e '^FUZZ start' -e '^FUZZ MISMATCH signature=' -e '^FUZZ   diff' -e '^FUZZ flaky-timeout' fuzz.log
             if ! grep -aq '^FUZZ summary' fuzz.log; then
               echo "NO SUMMARY (crash or early failure). Last case started:"
               grep -a '^FUZZ case' fuzz.log | tail -n 1
@@ -130,7 +134,7 @@ jobs:
           # One annotation per mismatch class of the end summary: the line
           # (master seed, index, case seed, settings, query, replay command)
           # followed by its diff lines, joined with an escaped newline.
-          awk '/^FUZZ MISMATCH signature=/ { if (n++ < 10) { if (msg != "") print msg; msg = $0 } else msg = ""; next }
+          awk '/^FUZZ MISMATCH signature=/ { if (msg != "") print msg; msg = (n++ < 10) ? $0 : ""; next }
                /^FUZZ   diff / { if (msg != "") msg = msg "\\n" $0; next }
                /^FUZZ (flaky|case|\.\.\.|table)/ { next }
                END { if (msg != "") print msg }' fuzz.log |
