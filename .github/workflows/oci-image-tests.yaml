@@ -1,0 +1,42 @@
+# Builds the release image and smoke tests it on the release PR, so a release
+# that would not produce a working image cannot be merged. Required in the
+# main-branch-protection ruleset (org-control-plane); on other PRs the job is
+# skipped, which counts as passing.
+name: OCI Image Tests
+
+on:
+  pull_request:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oci-image-tests:
+    name: OCI Image Tests
+    # Only the release PR: a release build is slow (no build cache).
+    if: startsWith(github.head_ref, 'release-please--branches--')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CONTAINER_ENGINE: docker
+      # Keep in sync with the image matrix in release-please.yaml.
+      PG_VERSIONS: "18"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and smoke test the release image
+        run: |
+          for pg in $PG_VERSIONS; do
+            docker build --build-arg "PG_MAJOR=$pg" --build-arg BUILD_PROFILE=release \
+              --tag "pg-otel:$pg" .
+            scripts/smoke-test-image.sh "pg-otel:$pg"
+          done

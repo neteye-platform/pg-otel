@@ -959,7 +959,7 @@ mod tests {
 
     #[pg_test]
     fn literal_content_never_appears_in_output() {
-        let secrets = [
+        let literals = [
             "hunter2",
             "4111111111111111",
             "s3cr3t",
@@ -971,8 +971,8 @@ mod tests {
                    -- s3cr3t\n\
                    SELECT $$s3cr3t$$, $q$s3cr3t$q$, U&'s3cr3t', 0xCAFE, -4111111111111111";
         let out = norm(sql);
-        for secret in secrets {
-            assert!(!out.contains(secret), "{secret} leaked in {out:?}");
+        for literal in literals {
+            assert!(!out.contains(literal), "{literal} leaked in {out:?}");
         }
         assert!(!out.contains("--"));
     }
@@ -1098,8 +1098,11 @@ mod tests {
                  FROM t WHERE c = '{word}' 'more {word}'"
             );
             let out = norm(&sql);
-            for secret in [&word, &bits, &hex, &digits] {
-                assert!(!out.contains(secret.as_str()), "{secret} leaked in {out:?}");
+            for literal in [&word, &bits, &hex, &digits] {
+                assert!(
+                    !out.contains(literal.as_str()),
+                    "{literal} leaked in {out:?}"
+                );
             }
             assert!(!out.contains("--") && !out.contains("/*"), "{out:?}");
         }

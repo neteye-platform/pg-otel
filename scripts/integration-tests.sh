@@ -45,7 +45,8 @@ dump_logs() {
   "$ENGINE" logs "$suffix-postgres" 2>&1 | sed 's/^/postgres: /' || true
 }
 
-"$ENGINE" build --build-arg "PG_MAJOR=$PG_MAJOR" -t "$image" -f tests/integration/Dockerfile .
+"$ENGINE" build --build-arg "PG_MAJOR=$PG_MAJOR" \
+  --build-arg BUILD_PROFILE=debug -t "$image" -f Dockerfile .
 "$ENGINE" network create "$network" >/dev/null
 
 # --user 0 so that, with rootless podman, the output files belong to the caller.
@@ -55,13 +56,12 @@ dump_logs() {
   -v "$out_dir:/out:z" \
   "$COLLECTOR_IMAGE" --config /etc/otelcol/config.yaml >/dev/null
 
-# The tests configure pg_otel with ALTER SYSTEM, so do not pass pg_otel.* with -c:
-# command line settings take precedence over it.
+# The image preloads pg_otel. The tests configure it with ALTER SYSTEM, so do
+# not pass pg_otel.* with -c: command line settings take precedence over it.
 "$ENGINE" run -d --name "$suffix-postgres" --network "$network" \
   -p "127.0.0.1:$PGPORT:5432" \
   -e POSTGRES_HOST_AUTH_METHOD=trust \
-  "$image" \
-  -c shared_preload_libraries=pg_otel >/dev/null
+  "$image" >/dev/null
 
 for _ in $(seq 60); do
   "$ENGINE" exec "$suffix-postgres" pg_isready -U postgres -q && break

@@ -1,0 +1,252 @@
+# Maintains the release PR (see release-please-config.json). Merging it tags
+# vX.Y.Z and creates a draft release; the same run then publishes the
+# PostgreSQL image with pg_otel: it refuses to overwrite a published version,
+# builds, smoke tests and pushes the image, then adds the image references to
+# the draft release and publishes it.
+#
+# If a release job fails, use "Re-run failed jobs": the re-run keeps the
+# outputs of the successful release-please job.
+name: Release Please
+
+on:
+  push:
+    branches:
+      - "main"
+
+permissions:
+  contents: none
+
+# Queue rather than cancel: a later push to main must not abort a release.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      # Unprefixed because the package path is ".".
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # Not GITHUB_TOKEN: the PRs it creates do not trigger workflows, so the
+      # release PR checks would not run.
+      - name: Generate GitHub App token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: generate-token
+        with:
+          app-id: ${{ vars.NETEYE_APP_ID }}
+          private-key: ${{ secrets.NETEYE_APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+          permission-contents: write
+          permission-issues: write
+
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+
+  image:
+    name: image (PostgreSQL ${{ matrix.pg }})
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    # Generous upper bound for the two builds and the smoke test.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Add 19 once postgres:19 is on Docker Hub, with a base-19 stage in
+        # the Dockerfile. Keep in sync with PG_VERSIONS below and in
+        # oci-image-tests.yaml.
+        pg: ["18"]
+    env:
+      CONTAINER_ENGINE: docker
+      IMAGE_REPOSITORY: ${{ github.repository_owner }}/postgres
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+    steps:
+      # A released tag is immutable. Only an authoritative 404 from the
+      # registry lets the release proceed: an exit code alone cannot tell a
+      # missing manifest from an unreachable registry or a refused token.
+      - name: Refuse to overwrite a released version
+        env:
+          PG_MAJOR: ${{ matrix.pg }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$PG_MAJOR-otel-${TAG#v}"
+          reference="ghcr.io/$IMAGE_REPOSITORY:$tag"
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+          body="$(mktemp)"
+          trap 'rm -f "$body"' EXIT
+          # The credentials go through --config on stdin, not the command line.
+          status="$(curl --silent --show-error --output "$body" --write-out '%{http_code}' \
+            --config - <<REQUEST || true
+          user = "${GITHUB_REPOSITORY_OWNER}:${GITHUB_TOKEN}"
+          url = "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_REPOSITORY}:pull"
+          REQUEST
+          )"
+          [ "$status" = 200 ] || fail "GHCR refused a pull token (HTTP $status)"
+          token="$(jq -er .token "$body")" || fail "GHCR returned no pull token"
+          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.oci.image.index.v1+json' \
+            --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            --config - <<REQUEST || true
+          header = "Authorization: Bearer ${token}"
+          url = "https://ghcr.io/v2/${IMAGE_REPOSITORY}/manifests/${tag}"
+          REQUEST
+          )"
+          case "$status" in
+            404) echo "$reference is not published yet." ;;
+            200) fail "$reference is already published; released tags are immutable." ;;
+            *) fail "Cannot tell whether $reference is published (HTTP $status)." ;;
+          esac
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ env.IMAGE_REPOSITORY }}
+          flavor: latest=false
+          # value=: this run is a push to main, not to the tag.
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }},prefix=${{ matrix.pg }}-otel-
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }},prefix=${{ matrix.pg }}-otel-
+            type=raw,value=${{ matrix.pg }}-otel
+
+      # load: true cannot carry attestations, so build once to test and again
+      # to push; the second build reuses the cache of the first.
+      - name: Build image for the smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          build-args: |
+            PG_MAJOR=${{ matrix.pg }}
+            BUILD_PROFILE=release
+          platforms: linux/amd64
+          load: true
+          tags: pg-otel-smoke:local
+
+      - name: Smoke test
+        run: scripts/smoke-test-image.sh pg-otel-smoke:local
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          build-args: |
+            PG_MAJOR=${{ matrix.pg }}
+            BUILD_PROFILE=release
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      # Deployments should pin the digest; the tags other than X.Y.Z move.
+      - name: Report the published digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          PG_MAJOR: ${{ matrix.pg }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::No digest for the pushed image: '$DIGEST'"
+            exit 1
+          }
+          # The backticks in the formats are Markdown, not command substitution.
+          # shellcheck disable=SC2016
+          {
+            printf '### Published PostgreSQL %s image\n\n' "$PG_MAJOR"
+            printf '    ghcr.io/%s@%s\n\nTags:\n\n' "$IMAGE_REPOSITORY" "$DIGEST"
+            # One tag per line.
+            while IFS= read -r tag; do
+              printf '* `%s`\n' "$tag"
+            done <<<"$TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish release
+    needs: [release-please, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      # Read the digests back from GHCR while the package is private.
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          skopeo login ghcr.io --username "$GITHUB_REPOSITORY_OWNER" \
+            --password-stdin <<<"$GITHUB_TOKEN"
+
+      - name: Add the images to the notes and publish the release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          OWNER: ${{ github.repository_owner }}
+          # Keep in sync with the image job matrix.
+          PG_VERSIONS: "18"
+        run: |
+          version="${TAG#v}"
+          major_minor="${version%.*}"
+          # Safe to re-run: skip the append if the notes already have the
+          # section, and only publish while the release is still a draft.
+          release="$(gh release view "$TAG" --json isDraft,body)"
+          if [ "$(jq -r .isDraft <<<"$release")" != true ]; then
+            echo "Release $TAG is already published."
+            exit 0
+          fi
+          notes="$(mktemp)"
+          jq -r .body <<<"$release" > "$notes"
+          # The backticks in the formats are Markdown, not command substitution.
+          # shellcheck disable=SC2016
+          if ! grep -qx '## Images' "$notes"; then
+            {
+              printf '\n## Images\n\n'
+              for pg in $PG_VERSIONS; do
+                # A matrix job exposes only one value per output, so read each
+                # digest back from the immutable X.Y.Z tag.
+                digest="$(skopeo inspect --format '{{.Digest}}' \
+                  "docker://ghcr.io/$OWNER/postgres:$pg-otel-$version")"
+                [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+                  echo "::error::No digest for the PostgreSQL $pg image: '$digest'" >&2
+                  exit 1
+                }
+                printf '* PostgreSQL %s:\n' "$pg"
+                printf '  * `ghcr.io/%s/postgres@%s`\n' "$OWNER" "$digest"
+                printf '  * `ghcr.io/%s/postgres:%s-otel-%s`\n' "$OWNER" "$pg" "$version"
+                printf '  * `ghcr.io/%s/postgres:%s-otel-%s`\n' "$OWNER" "$pg" "$major_minor"
+                printf '  * `ghcr.io/%s/postgres:%s-otel`\n' "$OWNER" "$pg"
+              done
+            } >> "$notes"
+          fi
+          gh release edit "$TAG" --draft=false --notes-file "$notes"
