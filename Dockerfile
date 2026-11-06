@@ -25,7 +25,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # hadolint ignore=DL3008
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      build-essential ca-certificates curl clang libclang-dev pkg-config \
+      build-essential ca-certificates curl clang libclang-dev libicu-dev pkg-config \
       postgresql-server-dev-${PG_MAJOR} \
  && rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/rustup CARGO_HOME=/cargo PATH=/cargo/bin:$PATH
