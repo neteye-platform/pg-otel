@@ -1,0 +1,70 @@
+[package]
+name = "pg_otel"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["pg19"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18" ]
+pg19 = ["pgrx/pg19", "pgrx-tests/pg19" ]
+pg_test = ["dep:serde_json", "dep:libc"]
+pg_bench = ["dep:pgrx-bench"]
+
+[dependencies]
+opentelemetry = { version = "0.32.0", default-features = false, features = ["tracing"] }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
+tonic = { version = "0.14.6", features = ["tls-ring"] }
+pgrx = "=0.19.1"
+tokio = { version = "1.52.3", features = ["rt", "time"] }
+fastrand = "2.4.1"
+serde_json = { version = "1.0.154", optional = true, features = ["float_roundtrip"] } # only for the fuzzer, via `pg_test`
+libc = { version = "0.2.191", optional = true } # only for the fuzzer watchdog, via `pg_test`
+
+[dependencies.opentelemetry-otlp]
+version = "0.32.0"
+default-features = false
+features = [
+    "trace", # We only support traces for now.
+    "http-proto", "zstd-http", "hyper-client", # http client
+    "grpc-tonic", "zstd-tonic", # grpc client
+    "tls-ring", "tls-roots", "tls-webpki-roots" # tls config
+]
+
+[dependencies.pgrx-bench]
+version = "=0.19.1"
+optional = true
+
+[dev-dependencies]
+postgres = "0.19.14"
+libc = "0.2.191"
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+
+[dev-dependencies.pgrx-tests]
+version = "=0.19.1"
+
+# Needs a running PostgreSQL and OpenTelemetry collector, see tests/integration.
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+multiple_unsafe_ops_per_block = "warn"
+ref_as_ptr = "warn"
+borrow_as_ptr = "warn"

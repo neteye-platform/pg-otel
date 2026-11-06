@@ -1,0 +1,28 @@
+# Collector used by the integration tests. The gRPC and HTTP receivers feed
+# separate files so the tests can tell which transport delivered a trace.
+receivers:
+  otlp/grpc:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+  otlp/http:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  file/grpc:
+    path: /out/grpc.jsonl
+    flush_interval: 200ms
+  file/http:
+    path: /out/http.jsonl
+    flush_interval: 200ms
+
+service:
+  pipelines:
+    traces/grpc:
+      receivers: [otlp/grpc]
+      exporters: [file/grpc]
+    traces/http:
+      receivers: [otlp/http]
+      exporters: [file/http]

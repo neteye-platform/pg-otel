@@ -84,3 +84,22 @@ repos:
     hooks:
       - id: renovate-config-validator
         args: [--strict]
+
+  # Local-only: CI runs these in the `lint` job of rust-tests.yaml, which sets
+  # up PostgreSQL and pgrx; the shared pre-commit runner has neither.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+        groups: [no-ci]
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets --locked -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        groups: [no-ci]

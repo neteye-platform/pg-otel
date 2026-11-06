@@ -1,0 +1,6 @@
+comment = 'OpenTelemetry tracing of PostgreSQL query planning and execution'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_otel'
+relocatable = false
+superuser = true
+trusted = false
