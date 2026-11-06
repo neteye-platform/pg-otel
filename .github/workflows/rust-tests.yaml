@@ -115,3 +115,24 @@ jobs:
         run: |
           docker logs collector || true
           cat "$RUNNER_TEMP/postgres.log" || true
+
+  # The required status check: one stable name, whatever the jobs and matrix
+  # above contain. always() matters: a job skipped because a dependency failed
+  # would count as passing.
+  rust-tests-status:
+    name: Rust Tests Status
+    needs: [lint, unit-tests]
+    if: always()
+    permissions:
+      contents: none
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the Rust job results
+        env:
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::A Rust job failed or was cancelled"
+            exit 1
+          fi

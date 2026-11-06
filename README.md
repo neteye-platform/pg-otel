@@ -83,6 +83,43 @@ and clients; the old names are no longer used by the extension.
 being executed is exported (not other statements of a multi-statement string),
 cut to 4096 bytes. In `off` mode no `db.query.text` attribute is set.
 
+## Docker image
+
+Releases are published as PostgreSQL images with pg_otel installed and
+preloaded, for `linux/amd64`:
+
+```sh
+docker run -e POSTGRES_PASSWORD=... ghcr.io/neteye-platform/postgres:18-otel
+```
+
+The tags are `18-otel-X.Y.Z` (one release, never changes), `18-otel-X.Y` (the
+latest patch release) and `18-otel` (the latest release). The `18` is the
+PostgreSQL major version. The PostgreSQL patch version is the one current when
+the image was built.
+
+The image works like the official `postgres` image, including its environment
+variables and `/docker-entrypoint-initdb.d`. Its entrypoint adds
+`-c shared_preload_libraries=pg_otel` to the `postgres` command. If you pass
+your own `shared_preload_libraries`, it must include `pg_otel`, because the
+last `-c` wins. Other commands (`bash`, `psql`, ...) run unchanged.
+
+Unlike the official image, it runs as the `postgres` user (`999:999`) from the
+start, not as root. Named volumes work as they are; a bind-mounted data
+directory must be writable by uid 999, or pass `--user` with the uid that owns
+it.
+
+Configure the `pg_otel.*` GUCs with `-c`, with `ALTER SYSTEM` or with a mounted
+configuration file, as for any PostgreSQL server:
+
+```sh
+docker run -e POSTGRES_PASSWORD=... ghcr.io/neteye-platform/postgres:18-otel \
+  -c pg_otel.otlp_endpoint=http://collector:4317 -c pg_otel.min_duration_ms=0
+```
+
+When the data directory is first initialised, [`sql/setup.sql`](sql/setup.sql)
+runs in `template1` and in `$POSTGRES_DB`, so the SQL functions exist in every
+database created afterwards. For an existing data directory, run it yourself.
+
 ## How spans are exported
 
 Backends build all spans of a statement in local memory and then put them in a
@@ -117,8 +154,10 @@ SELECT pg_otel_dropped_spans();
 The SQL functions are not part of the library's own setup: after installing
 and restarting the server, run [`sql/setup.sql`](sql/setup.sql) in each
 database where you want them (`psql -d <database> -f sql/setup.sql`). It is
-safe to run again, for example after upgrading, and it also contains an
-example configuration to adapt first.
+safe to run again, for example after upgrading. The
+[Docker image](#docker-image) runs it for you.
+[`sql/example-config.sql`](sql/example-config.sql) is an example
+`ALTER SYSTEM` configuration to adapt first; it is not part of `setup.sql`.
 
 Raise `pg_otel.queue_size_kb` if this number grows. A single statement whose
 spans together exceed the queue size can never be exported.
@@ -395,7 +434,8 @@ this short time (for me at least).
 `tests/integration` exports spans from a real PostgreSQL server to a real
 OpenTelemetry collector (gRPC and HTTP) and checks what the collector wrote.
 Locally everything runs in containers, with the extension built inside the
-PostgreSQL image so that it matches the server's glibc:
+PostgreSQL image (the root `Dockerfile`, the same one the release image uses,
+here as a debug build) so that it matches the server's glibc:
 
 ```sh
 scripts/integration-tests.sh                 # PostgreSQL 18, podman or docker
@@ -429,3 +469,24 @@ spans (see `pg_otel.collection_timing`).
 It is not part of the pull request checks. The `Fuzz` workflow runs it daily
 for two hours on PostgreSQL 18 and 19 (three shards each), and can be started
 by hand from the Actions tab with a seed and a duration.
+
+## Releasing
+
+Releases are automated with
+[release-please](https://github.com/googleapis/release-please). It keeps a
+release pull request up to date from the conventional commits on `main`
+(`release-please.yaml`). The release pull request also builds the image and
+smoke tests it (`oci-image-tests.yaml`, run by hand with
+`scripts/smoke-test-image.sh IMAGE`), and cannot be merged unless that passes.
+
+Merging it tags `vX.Y.Z` and creates a draft GitHub release. The same
+`release-please.yaml` run then refuses to overwrite an already published
+`18-otel-X.Y.Z`, builds, smoke tests and pushes the image, then adds the image
+references and digests to the release and publishes it. The digest of each
+pushed image is also in the run summary. If a job fails, use "Re-run failed
+jobs".
+
+The PostgreSQL base image is pinned by tag and digest in the `Dockerfile`, and
+Renovate opens pull requests to bump it. A bump is released only once a
+releasable commit (`fix:`, `feat:`) lands; for a `chore(deps)` bump, follow up
+with e.g. `git commit --allow-empty -m "fix: rebuild on PostgreSQL 18.x"`.
