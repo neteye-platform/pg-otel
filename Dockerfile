@@ -8,7 +8,7 @@ ARG BUILD_PROFILE=release
 
 # One pinned base per supported major, so Renovate can track each tag and
 # digest; PG_MAJOR selects one and BuildKit skips the others.
-FROM postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42 AS base-18
+FROM postgres:18.7@sha256:9f4fd4aa918f52ae3d6f3b687f1de90d8f867cd4d520021545a9a50c120eae3b AS base-18
 
 # hadolint and Trivy cannot resolve the ARG, so they take base-${PG_MAJOR}
 # for an untagged image instead of a stage above.
