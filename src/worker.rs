@@ -259,18 +259,26 @@ impl ExportFailures {
     }
 }
 
+/// Sets only the options configured through GUCs; anything left unset is
+/// resolved by the exporter from the standard `OTEL_EXPORTER_OTLP_*` variables.
+fn apply_export_config<B: WithExportConfig>(mut builder: B, config: &ExporterConfig) -> B {
+    if let Some(endpoint) = &config.endpoint {
+        builder = builder.with_endpoint(endpoint);
+    }
+    if let Some(ms) = config.timeout_ms {
+        builder = builder.with_timeout(Duration::from_millis(ms.into()));
+    }
+    builder
+}
+
 async fn build_exporter() -> Option<SpanExporter> {
     let config = ExporterConfig::load()?;
-    let endpoint = config.endpoint.clone();
-    let timeout = Duration::from_millis(config.timeout_ms as u64);
     let protocol = config.protocol.to_ascii_lowercase();
 
     let result = match protocol.as_str() {
         "grpc" | "grpc-tonic" => {
-            let mut builder = opentelemetry_otlp::SpanExporterBuilder::new()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .with_timeout(timeout);
+            let mut builder = opentelemetry_otlp::SpanExporterBuilder::new().with_tonic();
+            builder = apply_export_config(builder, &config);
             if let Some(path) = config.ca_certificate {
                 let pem = match fs::read(&path) {
                     Ok(pem) => pem,
@@ -298,10 +306,8 @@ async fn build_exporter() -> Option<SpanExporter> {
             builder.build()
         }
         "http" | "http/protobuf" | "http-binary" => {
-            let mut builder = opentelemetry_otlp::SpanExporterBuilder::new()
-                .with_http()
-                .with_endpoint(endpoint)
-                .with_timeout(timeout);
+            let mut builder = opentelemetry_otlp::SpanExporterBuilder::new().with_http();
+            builder = apply_export_config(builder, &config);
             if let Some(authorization) = config.authorization {
                 let mut headers = HashMap::new();
                 headers.insert("Authorization".to_owned(), authorization);

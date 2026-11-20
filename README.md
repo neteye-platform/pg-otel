@@ -58,9 +58,9 @@ pg_otel.min_duration_ms = 0 # -1 (default) disables tracing, 0 traces every stat
 
 | GUC | Type | Default | Who can change it | Description |
 | --- | --- | --- | --- | --- |
-| `pg_otel.otlp_endpoint` | string | `http://localhost:4317` | config file / reload | OTLP collector endpoint. |
-| `pg_otel.otlp_protocol` | string | `grpc` | config file / reload | `grpc` or `http/protobuf`. |
-| `pg_otel.otlp_timeout_ms` | int (ms) | `10000` | config file / reload | Exporter timeout (1 to 86400000). |
+| `pg_otel.otlp_endpoint` | string | unset | config file / reload | OTLP collector endpoint. When unset, the exporter uses `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT`, else its built-in default. |
+| `pg_otel.otlp_protocol` | string | unset | config file / reload | `grpc` or `http/protobuf`. When unset, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` / `OTEL_EXPORTER_OTLP_PROTOCOL` is used, else `grpc`. |
+| `pg_otel.otlp_timeout_ms` | int (ms) | `0` (unset) | config file / reload | Exporter timeout (0 to 86400000). `0` defers to `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` / `OTEL_EXPORTER_OTLP_TIMEOUT`, else 10 seconds. |
 | `pg_otel.otlp_authorization` | string | unset | config file / reload | Value of the `Authorization` header. **Superuser-only**: `SHOW` raises a permission denied error for non-privileged roles (superusers and members of `pg_read_all_settings` can read it), it is hidden from `pg_settings` for them, and it is excluded from `SHOW ALL`. |
 | `pg_otel.otlp_ca_certificate` | string | unset | config file / reload | Path to a custom CA certificate. |
 | `pg_otel.service_name` | string | `postgresql` | config file / reload | `service.name` resource attribute. |
