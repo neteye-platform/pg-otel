@@ -86,14 +86,14 @@ cut to 4096 bytes. In `off` mode no `db.query.text` attribute is set.
 ## Docker image
 
 Releases are published as PostgreSQL images with pg_otel installed and
-preloaded, for `linux/amd64`:
+preloaded, for `linux/amd64` on PostgreSQL 18 and 19:
 
 ```sh
-docker run -e POSTGRES_PASSWORD=... ghcr.io/neteye-platform/postgres:18-otel
+docker run -e POSTGRES_PASSWORD=... ghcr.io/neteye-platform/postgres:19-otel
 ```
 
-The tags are `18-otel-X.Y.Z` (one release, never changes), `18-otel-X.Y` (the
-latest patch release) and `18-otel` (the latest release). The `18` is the
+The tags are `19-otel-X.Y.Z` (one release, never changes), `19-otel-X.Y` (the
+latest patch release) and `19-otel` (the latest release). The `19` is the
 PostgreSQL major version. The PostgreSQL patch version is the one current when
 the image was built.
 
@@ -438,8 +438,8 @@ PostgreSQL image (the root `Dockerfile`, the same one the release image uses,
 here as a debug build) so that it matches the server's glibc:
 
 ```sh
-scripts/integration-tests.sh                 # PostgreSQL 18, podman or docker
-PG_MAJOR=19 scripts/integration-tests.sh     # another major version
+scripts/integration-tests.sh                 # PostgreSQL 19, podman or docker
+PG_MAJOR=18 scripts/integration-tests.sh     # another major version
 scripts/integration-tests.sh --keep          # leave the containers up to debug
 ```
 

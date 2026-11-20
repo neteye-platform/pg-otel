@@ -62,10 +62,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Add 19 once postgres:19 is on Docker Hub, with a base-19 stage in
-        # the Dockerfile. Keep in sync with PG_VERSIONS below and in
-        # oci-image-tests.yaml.
-        pg: ["18"]
+        # Each needs a base-<pg> stage in the Dockerfile. Keep in sync with
+        # PG_VERSIONS below and in oci-image-tests.yaml.
+        pg: ["18", "19"]
     env:
       CONTAINER_ENGINE: docker
       IMAGE_REPOSITORY: ${{ github.repository_owner }}/postgres
@@ -214,7 +213,7 @@ jobs:
           TAG: ${{ needs.release-please.outputs.tag_name }}
           OWNER: ${{ github.repository_owner }}
           # Keep in sync with the image job matrix.
-          PG_VERSIONS: "18"
+          PG_VERSIONS: "18 19"
         run: |
           version="${TAG#v}"
           major_minor="${version%.*}"
