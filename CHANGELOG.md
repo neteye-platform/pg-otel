@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/neteye-platform/pg-otel/compare/v0.1.0...v0.1.1) (2026-11-20)
+
+
+### Bug Fixes
+
+* **deps:** pin dependencies ([#33](https://github.com/neteye-platform/pg-otel/issues/33)) ([b81ab09](https://github.com/neteye-platform/pg-otel/commit/b81ab098aa2b3535655c4f5cc08e81a3c37677fa))
+* remove release version for release please ([#45](https://github.com/neteye-platform/pg-otel/issues/45)) ([303d4d6](https://github.com/neteye-platform/pg-otel/commit/303d4d616a4a21759c34f3085200e357ae885761))
+
 ## [0.1.0](https://github.com/neteye-platform/pg-otel/compare/v0.1.0...v0.1.0) (2026-11-17)
 
 
