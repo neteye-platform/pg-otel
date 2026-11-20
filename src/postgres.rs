@@ -751,14 +751,15 @@ enum TraceDecision {
 
 /// Picks the parent trace of a statement.
 ///
-/// Precedence: a valid `pg_otel.traceparent` GUC value, then the first valid
-/// `traceparent` found in a comment of the query text, otherwise a new trace.
+/// Precedence: the first valid `traceparent` found in a comment of the query
+/// text (the most explicit), then a valid `pg_otel.traceparent` GUC value,
+/// otherwise a new trace.
 /// Invalid values are ignored rather than reported. A valid but unsampled
 /// remote parent suppresses tracing of the statement.
 fn decide_parent(guc_traceparent: Option<&str>, query_text: Option<&str>) -> TraceDecision {
-    let remote = guc_traceparent
-        .and_then(parse_traceparent)
-        .or_else(|| query_text.and_then(traceparent_from_comments));
+    let remote = query_text
+        .and_then(traceparent_from_comments)
+        .or_else(|| guc_traceparent.and_then(parse_traceparent));
     match remote {
         None => TraceDecision::Trace(ParentContext::new_root()),
         Some(remote) if !remote.is_sampled() => TraceDecision::Skip,
@@ -1156,9 +1157,19 @@ mod unit_tests {
     }
 
     #[test]
-    fn guc_takes_precedence_over_comment() {
+    fn comment_takes_precedence_over_guc() {
         let text = format!("SELECT 1 /* traceparent='{OTHER_TP}' */");
         let TraceDecision::Trace(parent) = decide_parent(Some(TP), Some(&text)) else {
+            panic!("expected trace");
+        };
+        assert_eq!(parent.trace_id.to_string(), trace_hex(OTHER_TP));
+        assert!(parent.is_remote);
+    }
+
+    #[test]
+    fn invalid_comment_falls_back_to_guc() {
+        let text = "SELECT 1 /* traceparent='bogus' */";
+        let TraceDecision::Trace(parent) = decide_parent(Some(TP), Some(text)) else {
             panic!("expected trace");
         };
         assert_eq!(parent.trace_id.to_string(), trace_hex(TP));
