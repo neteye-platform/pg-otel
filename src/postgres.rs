@@ -1376,8 +1376,16 @@ mod tests {
         let wall = span.end_time.duration_since(span.start_time).unwrap();
         assert_eq!(wall.as_micros() as f64, total.floor());
         let planning = number(span, "postgresql.planning.duration.us");
+        // The three durations come from three clocks: `total` from the wall
+        // clock, `planning` from `Instant`, `micros` from calibrated TSC ticks.
+        // The timeline places execution at `end - micros`, so when the TSC
+        // reading runs a few microseconds long, planning is clamped out of the
+        // span and `total` falls short of `micros + planning` by up to
+        // `planning` (issue #39: `50599.987 < 50599.987 + 10.886`). Allow the
+        // same relative clock error as the upper bound; a missing planning or
+        // execution phase would still fail.
         assert!(
-            total >= micros + planning - 1.0,
+            total >= (micros + planning) / 1.05 - 1.0,
             "{total} < {micros} + {planning}"
         );
         assert!(total <= measured_us * 1.05 + 1_000.0);
