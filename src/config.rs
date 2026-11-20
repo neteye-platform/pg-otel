@@ -10,7 +10,7 @@ fn define_otlp_endpoint_guc() {
     GucRegistry::define_string_guc(
         OTLP_ENDPOINT_GUC,
         c"OTLP exporter endpoint",
-        c"The endpoint used by the OTLP exporter.",
+        c"The endpoint used by the OTLP exporter. When unset, the OTEL_EXPORTER_OTLP_* environment variables apply.",
         &OTLP_ENDPOINT,
         GucContext::Sighup,
         GucFlags::default(),
@@ -18,10 +18,7 @@ fn define_otlp_endpoint_guc() {
 }
 
 fn get_otlp_endpoint() -> Option<String> {
-    let Some(guc_var) = OTLP_ENDPOINT.get() else {
-        log_config_not_set(OTLP_ENDPOINT_GUC);
-        return None;
-    };
+    let guc_var = OTLP_ENDPOINT.get()?;
     match guc_var.into_string() {
         Ok(endpoint) => Some(endpoint),
         Err(err) => {
@@ -32,15 +29,15 @@ fn get_otlp_endpoint() -> Option<String> {
 }
 
 const OTLP_TIMEOUT_MS_GUC: &CStr = c"pg_otel.otlp_timeout_ms";
-pub static OTLP_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(10_000);
+pub static OTLP_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 fn define_otlp_timeout_ms_guc() {
     GucRegistry::define_int_guc(
         OTLP_TIMEOUT_MS_GUC,
         c"OTLP exporter timeout in milliseconds",
-        c"The timeout used by the OTLP exporter.",
+        c"The timeout used by the OTLP exporter. 0 (unset) defers to the OTEL_EXPORTER_OTLP_* environment variables.",
         &OTLP_TIMEOUT_MS,
-        1,
+        0,
         86_400_000,
         GucContext::Sighup,
         GucFlags::default(),
@@ -49,13 +46,13 @@ fn define_otlp_timeout_ms_guc() {
 
 const OTLP_PROTOCOL_GUC: &CStr = c"pg_otel.otlp_protocol";
 pub static OTLP_PROTOCOL: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"grpc"));
+    GucSetting::<Option<std::ffi::CString>>::new(None);
 
 fn define_otlp_protocol_guc() {
     GucRegistry::define_string_guc(
         OTLP_PROTOCOL_GUC,
         c"OTLP protocol",
-        c"The protocol used by the OTLP exporter.",
+        c"The protocol used by the OTLP exporter. When unset, the OTEL_EXPORTER_OTLP_* environment variables apply.",
         &OTLP_PROTOCOL,
         GucContext::Sighup,
         GucFlags::default(),
@@ -63,10 +60,7 @@ fn define_otlp_protocol_guc() {
 }
 
 fn get_otlp_protocol() -> Option<String> {
-    let Some(guc_var) = OTLP_PROTOCOL.get() else {
-        log_config_not_set(OTLP_PROTOCOL_GUC);
-        return None;
-    };
+    let guc_var = OTLP_PROTOCOL.get()?;
     match guc_var.into_string() {
         Ok(protocol) => Some(protocol),
         Err(err) => {
@@ -321,9 +315,12 @@ pub fn get_max_plan_spans() -> usize {
 
 #[derive(Clone, Debug)]
 pub struct ExporterConfig {
-    pub endpoint: String,
+    /// `None` leaves the endpoint to the exporter (`OTEL_EXPORTER_OTLP_*`).
+    pub endpoint: Option<String>,
+    /// Transport to use; resolved from the environment when the GUC is unset.
     pub protocol: String,
-    pub timeout_ms: u32,
+    /// `None` leaves the timeout to the exporter (`OTEL_EXPORTER_OTLP_*`).
+    pub timeout_ms: Option<u32>,
     pub authorization: Option<String>,
     pub ca_certificate: Option<String>,
     pub service_name: String,
@@ -347,9 +344,11 @@ impl ExporterConfig {
 
     pub fn load() -> Option<Self> {
         Some(Self {
-            endpoint: get_otlp_endpoint()?,
-            protocol: get_otlp_protocol()?,
-            timeout_ms: OTLP_TIMEOUT_MS.get() as u32,
+            endpoint: get_otlp_endpoint(),
+            protocol: resolve_protocol(get_otlp_protocol(), |name| std::env::var(name).ok()),
+            timeout_ms: u32::try_from(OTLP_TIMEOUT_MS.get())
+                .ok()
+                .filter(|&ms| ms > 0),
             authorization: get_otlp_authorization(),
             ca_certificate: get_otlp_ca_certificate(),
             service_name: get_otlp_service_name(),
@@ -357,10 +356,51 @@ impl ExporterConfig {
     }
 }
 
-fn log_config_not_set(name: &CStr) {
-    log!("Config variable {:?} is not set", name);
+/// Picks the transport: the GUC if set, else the standard OTLP protocol
+/// environment variables (signal-specific first), else `grpc`.
+///
+/// The transport must be chosen before the exporter is built because the
+/// TLS and authorization options differ per transport.
+fn resolve_protocol(guc: Option<String>, env: impl Fn(&str) -> Option<String>) -> String {
+    guc.or_else(|| env("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"))
+        .or_else(|| env("OTEL_EXPORTER_OTLP_PROTOCOL"))
+        .unwrap_or_else(|| "grpc".to_owned())
 }
 
 fn log_config_not_valid<E: Display>(name: &CStr, error: E) {
     log!("Config variable {:?} is not valid: {}", name, error);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_protocol;
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn protocol_defaults_to_grpc() {
+        assert_eq!(resolve_protocol(None, env(&[])), "grpc");
+    }
+
+    #[test]
+    fn protocol_guc_wins_over_env() {
+        let vars = [("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")];
+        assert_eq!(resolve_protocol(Some("grpc".into()), env(&vars)), "grpc");
+    }
+
+    #[test]
+    fn protocol_signal_env_wins_over_generic_env() {
+        let vars = [
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+            ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
+        ];
+        assert_eq!(resolve_protocol(None, env(&vars)), "http/protobuf");
+        assert_eq!(resolve_protocol(None, env(&vars[..1])), "grpc",);
+    }
 }
