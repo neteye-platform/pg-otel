@@ -876,6 +876,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-rustls"
+version = "0.27.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53"
+dependencies = [
+ "http",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
+ "webpki-roots",
+]
+
+[[package]]
 name = "hyper-timeout"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1449,17 +1465,23 @@ name = "pg_otel"
 version = "0.1.0"
 dependencies = [
  "fastrand",
+ "hyper-rustls",
+ "hyper-util",
  "libc",
  "opentelemetry",
+ "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "pgrx",
  "pgrx-bench",
  "pgrx-tests",
  "postgres",
+ "rustls",
+ "rustls-pki-types",
  "serde_json",
  "tokio",
  "tonic",
+ "webpki-roots",
 ]
 
 [[package]]

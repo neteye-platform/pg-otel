@@ -5,13 +5,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::HttpConnector;
 use opentelemetry::KeyValue;
+use opentelemetry_http::hyper::HyperClient;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::{
     Resource,
     trace::{SpanData, SpanExporter as _},
 };
 use pgrx::{bgworkers::BackgroundWorker, debug1, log, pg_sys};
+use rustls::{ClientConfig, RootCertStore};
+use rustls_pki_types::{CertificateDer, pem::PemObject};
 use tokio::runtime::Runtime;
 use tonic::{
     metadata::MetadataMap,
@@ -259,6 +264,48 @@ impl ExportFailures {
     }
 }
 
+/// Builds the HTTP client used for OTLP/HTTP. It speaks both `http://` and
+/// `https://`; for the latter the Mozilla root set is trusted, plus the CAs in
+/// `ca_certificate` (a PEM file) when given.
+fn build_http_client(
+    timeout: Duration,
+    ca_certificate: Option<&str>,
+) -> Result<HyperClient<HttpsConnector<HttpConnector>>, String> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = ca_certificate {
+        let pem = fs::read(path)
+            .map_err(|error| format!("Could not read OTLP CA certificate {path:?}: {error}"))?;
+        add_pem_certificates(&mut roots, &pem)
+            .map_err(|error| format!("Invalid OTLP CA certificate {path:?}: {error}"))?;
+    }
+    let tls = ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| error.to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .build();
+    Ok(HyperClient::new(connector, timeout, None))
+}
+
+/// Adds every certificate of a PEM bundle to `roots`; at least one is required.
+fn add_pem_certificates(roots: &mut RootCertStore, pem: &[u8]) -> Result<(), String> {
+    let mut added = 0;
+    for cert in CertificateDer::pem_slice_iter(pem) {
+        let cert = cert.map_err(|error| error.to_string())?;
+        roots.add(cert).map_err(|error| error.to_string())?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err("no certificate found".to_owned());
+    }
+    Ok(())
+}
+
 async fn build_exporter() -> Option<SpanExporter> {
     let config = ExporterConfig::load()?;
     let endpoint = config.endpoint.clone();
@@ -298,8 +345,16 @@ async fn build_exporter() -> Option<SpanExporter> {
             builder.build()
         }
         "http" | "http/protobuf" | "http-binary" => {
+            let client = match build_http_client(timeout, config.ca_certificate.as_deref()) {
+                Ok(client) => client,
+                Err(error) => {
+                    log!("{}", error);
+                    return None;
+                }
+            };
             let mut builder = opentelemetry_otlp::SpanExporterBuilder::new()
                 .with_http()
+                .with_http_client(client)
                 .with_endpoint(endpoint)
                 .with_timeout(timeout);
             if let Some(authorization) = config.authorization {
@@ -592,5 +647,48 @@ mod tests {
             .report(start + DROPPED_LOG_INTERVAL * 2, 9)
             .expect("a second report is due");
         assert!(message.contains("Dropped 4 spans"), "{message}");
+    }
+
+    const TEST_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBjDCCATGgAwIBAgIUHgt9hqBWYprM+yGvEnJqRIbkg2QwCgYIKoZIzj0EAwIw
+GjEYMBYGA1UEAwwPcGctb3RlbC10ZXN0LWNhMCAXDTI2MTEyMDA4MjAyMFoYDzIx
+MjYxMDI3MDgyMDIwWjAaMRgwFgYDVQQDDA9wZy1vdGVsLXRlc3QtY2EwWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAASF7xFc+6s08qoE01FlmoxnE71eCGrho9ahqu8w
+BjiWMQz6jrpw/IK+I7558OI8iRZIRZzxAxSF3j3Ma4/Zp3Jeo1MwUTAdBgNVHQ4E
+FgQU6N7uWdbRORke9Z6KOAIfzKk7aIEwHwYDVR0jBBgwFoAU6N7uWdbRORke9Z6K
+OAIfzKk7aIEwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEAgk6D
+5a9t0C5P637SlRGR8VsM0KOMAtkkODjiIgP+ywQCIQD6SdrmaJeh3fW6bcfwsDv9
+5NxdxFwumj6DI2l0RQ8lnA==
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn pem_bundle_is_added_to_the_root_store() {
+        let mut roots = RootCertStore::empty();
+        add_pem_certificates(&mut roots, TEST_CA.as_bytes()).unwrap();
+        assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn pem_without_certificates_is_rejected() {
+        let mut roots = RootCertStore::empty();
+        assert!(add_pem_certificates(&mut roots, b"not a certificate").is_err());
+    }
+
+    #[test]
+    fn http_client_uses_custom_ca_file() {
+        let dir = std::env::temp_dir().join(format!("pg_otel_ca_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("ca.pem");
+        let bad = dir.join("bad.pem");
+        fs::write(&good, TEST_CA).unwrap();
+        fs::write(&bad, "garbage").unwrap();
+
+        let timeout = Duration::from_secs(1);
+        assert!(build_http_client(timeout, None).is_ok());
+        assert!(build_http_client(timeout, good.to_str()).is_ok());
+        assert!(build_http_client(timeout, bad.to_str()).is_err());
+        assert!(build_http_client(timeout, Some("/nonexistent/ca.pem")).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

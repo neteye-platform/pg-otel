@@ -22,6 +22,12 @@ tokio = { version = "1.52.3", features = ["rt", "time"] }
 fastrand = "2.4.1"
 serde_json = { version = "1.0.154", optional = true, features = ["float_roundtrip"] } # only for the fuzzer, via `pg_test`
 libc = { version = "0.2.191", optional = true } # only for the fuzzer watchdog, via `pg_test`
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "webpki-tokio", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { version = "1.16.0", features = ["std"] }
+opentelemetry-http = { version = "0.33", default-features = false, features = ["hyper"] }
+webpki-roots = "1"
 
 [dependencies.opentelemetry-otlp]
 version = "0.33.0"

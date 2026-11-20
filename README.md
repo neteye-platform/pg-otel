@@ -50,7 +50,7 @@ pg_otel.otlp_endpoint = 'https://localhost:4317'
 pg_otel.otlp_protocol = 'grpc' # supports grpc or http/protobuf
 pg_otel.otlp_timeout_ms = 5000
 pg_otel.otlp_authorization = 'ApiKey ...' # contents of the Authorization header
-pg_otel.otlp_ca_certificate = '' # path to a CA certificate file if you have a custom CA
+pg_otel.otlp_ca_certificate = '' # path to a PEM CA certificate file if you have a custom CA (grpc and http/protobuf)
 pg_otel.min_duration_ms = 0 # -1 (default) disables tracing, 0 traces every statement
 ```
 
@@ -62,7 +62,7 @@ pg_otel.min_duration_ms = 0 # -1 (default) disables tracing, 0 traces every stat
 | `pg_otel.otlp_protocol` | string | `grpc` | config file / reload | `grpc` or `http/protobuf`. |
 | `pg_otel.otlp_timeout_ms` | int (ms) | `10000` | config file / reload | Exporter timeout (1 to 86400000). |
 | `pg_otel.otlp_authorization` | string | unset | config file / reload | Value of the `Authorization` header. **Superuser-only**: `SHOW` raises a permission denied error for non-privileged roles (superusers and members of `pg_read_all_settings` can read it), it is hidden from `pg_settings` for them, and it is excluded from `SHOW ALL`. |
-| `pg_otel.otlp_ca_certificate` | string | unset | config file / reload | Path to a custom CA certificate. |
+| `pg_otel.otlp_ca_certificate` | string | unset | config file / reload | Path to a PEM file with custom CA certificate(s). Used by both `grpc` and `http/protobuf`. |
 | `pg_otel.service_name` | string | `postgresql` | config file / reload | `service.name` resource attribute. |
 | `pg_otel.traceparent` | string | unset | any user, per session/transaction | W3C `traceparent` of the parent span. See [Usage](#usage). |
 | `pg_otel.query_text` | enum | `normalized` | **superuser** (or roles granted `SET` on the parameter) | `off`: no `db.query.text` attribute. `normalized`: literals are replaced with placeholders (quoted identifiers such as `"My Table"` are kept as is). `raw`: the query text as received (may contain sensitive data). The root span name always uses normalized text. When normalization fails (for example on `SQL_ASCII`), the name falls back to the operation and `normalized` produces no query text. |
