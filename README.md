@@ -210,14 +210,14 @@ SELECT * FROM my_table WHERE id = 1 /*traceparent='00-<trace-id>-<span-id>-01'*/
 SELECT * /* pg_otel.traceparent=<traceparent> */ FROM my_table WHERE id = 1;
 ```
 
-Values may be single or double quoted and percent-encoded. The GUC takes
-precedence over a comment, and invalid values are ignored. Comments are found
-with a plain text scan, so comment markers inside string literals also count.
+Values may be single or double quoted and percent-encoded. A comment takes
+precedence over the GUC, and invalid values are ignored. Comments are found with
+a plain text scan, so comment markers inside string literals also count.
 
 Without a (valid) `traceparent`, each statement starts a new trace. This also
 applies to statements run inside functions (nested SPI statements): each gets
-its own independent trace id unless `pg_otel.traceparent` is set, in which case
-they share it.
+its own independent trace id unless `pg_otel.traceparent` is set (and the
+statement has no comment `traceparent`), in which case they share it.
 
 If the `traceparent` has the sampled flag cleared (`...-00`), no spans are
 exported for the statement, as W3C trace context specifies. Note that this lets
