@@ -6,7 +6,7 @@
 #   scripts/integration-tests.sh [--keep] [cargo test args...]
 #
 # Environment:
-#   PG_MAJOR          PostgreSQL major version (default 18)
+#   PG_MAJOR          PostgreSQL major version (default 19)
 #   PGPORT            host port for PostgreSQL (default 55432)
 #   COLLECTOR_IMAGE   collector image
 #   CONTAINER_ENGINE  podman or docker (default: whichever is installed)
@@ -14,7 +14,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-PG_MAJOR="${PG_MAJOR:-18}"
+PG_MAJOR="${PG_MAJOR:-19}"
 PGPORT="${PGPORT:-55432}"
 COLLECTOR_IMAGE="${COLLECTOR_IMAGE:-docker.io/otel/opentelemetry-collector:0.163.1}"
 ENGINE="${CONTAINER_ENGINE:-$(command -v podman || command -v docker || true)}"

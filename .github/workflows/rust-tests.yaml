@@ -38,7 +38,7 @@ jobs:
         with:
           key: lint
       - name: Install cargo-pgrx
-        run: cargo install --locked cargo-pgrx --version =0.19.1
+        run: cargo install --locked cargo-pgrx --version =0.19.3
       - name: Initialise pgrx against the system PostgreSQL
         run: cargo pgrx init --pg19 "$PG_CONFIG"
       - name: Check formatting
@@ -72,7 +72,7 @@ jobs:
         with:
           key: pg${{ matrix.pg }}
       - name: Install cargo-pgrx
-        run: cargo install --locked cargo-pgrx --version =0.19.1
+        run: cargo install --locked cargo-pgrx --version =0.19.3
       - name: Initialise pgrx against the system PostgreSQL
         run: cargo pgrx init --pg${{ matrix.pg }} "$PG_CONFIG"
       - name: Let pgrx install the extension into the system PostgreSQL

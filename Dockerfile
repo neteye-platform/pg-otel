@@ -2,13 +2,14 @@
 # the one the local integration tests use (see scripts/integration-tests.sh).
 # Building inside the image keeps the extension and the server on the same
 # glibc and PostgreSQL build.
-ARG PG_MAJOR=18
+ARG PG_MAJOR=19
 # release, or debug for a faster build.
 ARG BUILD_PROFILE=release
 
 # One pinned base per supported major, so Renovate can track each tag and
 # digest; PG_MAJOR selects one and BuildKit skips the others.
 FROM postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42 AS base-18
+FROM postgres:19.0@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60 AS base-19
 
 # hadolint and Trivy cannot resolve the ARG, so they take base-${PG_MAJOR}
 # for an untagged image instead of a stage above.
@@ -31,7 +32,7 @@ RUN apt-get update \
 ENV RUSTUP_HOME=/rustup CARGO_HOME=/cargo PATH=/cargo/bin:$PATH
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
 # Keep in sync with the pgrx version in Cargo.toml.
-RUN cargo install --locked cargo-pgrx --version =0.19.1 \
+RUN cargo install --locked cargo-pgrx --version =0.19.3 \
  && cargo pgrx init --pg${PG_MAJOR} "$(command -v pg_config)"
 WORKDIR /src
 COPY . .
