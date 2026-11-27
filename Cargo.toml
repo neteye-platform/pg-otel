@@ -17,7 +17,7 @@ pg_bench = ["dep:pgrx-bench"]
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["tracing"] }
 opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["trace"] }
 tonic = { version = "=0.14.9", features = ["tls-ring"] }
-pgrx = "=0.19.3"
+pgrx = "=0.20.1"
 tokio = { version = "=1.54.1", features = ["rt", "time"] }
 fastrand = "=2.5.0"
 serde_json = { version = "=1.0.154", optional = true, features = ["float_roundtrip"] } # only for the fuzzer, via `pg_test`
@@ -34,7 +34,7 @@ features = [
 ]
 
 [dependencies.pgrx-bench]
-version = "=0.19.3"
+version = "=0.20.1"
 optional = true
 
 [dev-dependencies]
@@ -43,7 +43,7 @@ libc = "=0.2.191"
 serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
 
 [dev-dependencies.pgrx-tests]
-version = "=0.19.3"
+version = "=0.20.1"
 
 # Needs a running PostgreSQL and OpenTelemetry collector, see tests/integration.
 [[test]]
